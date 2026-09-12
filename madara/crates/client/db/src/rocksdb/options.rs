@@ -162,9 +162,7 @@ impl DbWriteMode {
             opts.disable_wal(true);
         }
 
-        if !self.fsync {
-            opts.set_sync(false);
-        }
+        opts.set_sync(self.fsync);
 
         opts
     }
@@ -561,6 +559,39 @@ mod tests {
     use crate::rocksdb::column::ALL_COLUMNS;
     use crate::rocksdb::RocksDBStorage;
     use std::fs;
+
+    #[test]
+    fn write_mode_controls_real_wal_sync() {
+        use rocksdb::{statistics::Ticker, DB};
+
+        for wal in [false, true] {
+            for fsync in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Options::default();
+                options.create_if_missing(true);
+                options.enable_statistics();
+                options.set_statistics_level(StatsLevel::All);
+                let database = DB::open(&options, directory.path()).unwrap();
+                let syncs_before = options.get_ticker_count(Ticker::WalFileSynced);
+                let result = database.put_opt(b"accepted", b"binding", &DbWriteMode { wal, fsync }.to_write_options());
+
+                if !wal && fsync {
+                    assert!(result.is_err(), "RocksDB cannot sync a disabled WAL");
+                    assert_eq!(database.get(b"accepted").unwrap(), None);
+                    continue;
+                }
+
+                result.unwrap();
+                assert_eq!(database.get(b"accepted").unwrap().as_deref(), Some(b"binding".as_slice()));
+                assert_eq!(options.get_ticker_count(Ticker::WalFileSynced) - syncs_before, u64::from(fsync));
+                if wal {
+                    drop(database);
+                    let reopened = DB::open(&options, directory.path()).unwrap();
+                    assert_eq!(reopened.get(b"accepted").unwrap().as_deref(), Some(b"binding".as_slice()));
+                }
+            }
+        }
+    }
 
     fn column_family_section<'a>(options: &'a str, column: &str) -> &'a str {
         let header = format!("[CFOptions \"{column}\"]");
