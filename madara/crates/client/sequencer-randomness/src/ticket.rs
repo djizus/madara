@@ -98,6 +98,38 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    pub(crate) fn restore(
+        intent: Intent,
+        envelope: Envelope,
+        state: State,
+        result: Option<Felt>,
+    ) -> Result<Self, TicketError> {
+        if state == State::Proposed
+            || matches!(state, State::Executed | State::TerminalRejected | State::Consumed) != result.is_some()
+            || envelope.action != intent.identity()?
+        {
+            return Err(TicketError::Transition);
+        }
+        let context = Context {
+            order: envelope.order,
+            predecessor: envelope.predecessor,
+            preceding_state: envelope.preceding_state,
+            timestamp: envelope.timestamp,
+            execution_config: envelope.execution_config,
+            l2_gas: envelope.l2_gas,
+        };
+        context.validate(&intent)?;
+        Ok(Self {
+            intent,
+            context,
+            state,
+            sampling_attempted: true,
+            envelope: Some(envelope),
+            submissions: Vec::new(),
+            result,
+        })
+    }
+
     pub fn propose(intent: Intent, context: Context) -> Result<Self, TicketError> {
         context.validate(&intent)?;
         Ok(Self {
@@ -157,6 +189,10 @@ impl Ticket {
         }
         self.state = State::Committed;
         Ok(())
+    }
+
+    pub(crate) fn envelope_for_journal(&self) -> Result<&Envelope, TicketError> {
+        self.envelope.as_ref().ok_or(TicketError::Uncommitted)
     }
 
     pub fn envelope(&self) -> Result<&Envelope, TicketError> {

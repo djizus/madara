@@ -11,7 +11,10 @@ workspace = true
 [dependencies]
 rustix = { version = "=1.1.2", features = ["rand"] }
 starknet-types-core = { workspace = true }
+starknet-crypto = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = "=0.7.13"
 
 [dev-dependencies]
 num-bigint = { workspace = true }

@@ -22,3 +22,11 @@ writes logs and a machine-readable report with source hashes.
 
 Operator honesty is trusted. Passing codec tests establishes neither honest sampling nor durability, fencing,
 preview resistance or performance of the accepted-ticket protocol.
+
+The PostgreSQL journal client uses the schema in `src/journal.sql`. It reserves sampling ownership with synchronous
+replication before calling the OS, verifies accepted records on the hot standby, and restores lifecycle state without
+creating a sampler. Storage functions fence each writer by login role and authority epoch. The companion
+`deploy/madara-rand/README.md` records acknowledgement, promotion and recovery procedures.
+
+Run the actual two-volume rehearsal with `deploy/madara-rand/journal/check.py` in the Eternum checkout. It requires
+the isolated Compose project and replaces its rehearsal schema. The host-loss gate remains separate.
