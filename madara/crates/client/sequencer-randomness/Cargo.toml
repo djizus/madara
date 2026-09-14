@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+rustix = { version = "=1.1.2", features = ["rand"] }
 starknet-types-core = { workspace = true }
 thiserror = { workspace = true }
 

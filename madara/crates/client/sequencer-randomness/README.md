@@ -1,7 +1,13 @@
 # Recorded sequencer randomness
 
-The first increment defines version 1 action and entropy-envelope codecs. It does not yet sample entropy, admit
-actions, connect a journal or modify the batcher. The absence of those consumers is an explicit integration gate.
+The crate implements version 1 codecs, checked full-width OS sampling and the accepted-ticket state machine.
+`Tickets` serializes live admission by canonical actor nonce; duplicate transport requests reuse the same ticket.
+The working set alone is not durable. Before sampling, the journal must persist exclusive ownership of the proposal;
+only its replicated commit acknowledgement may call `committed`. A lost sampling attempt cannot be recreated.
+
+The maximum recorded-context age is 300 seconds, with no future timestamp allowed. Signed expiry applies at acceptance.
+The same boundary vectors run in Rust and Cairo from `tests/fixtures/context-v1.txt`. Credentials, request identifiers
+and transaction hashes never enter action identity. Pending actions retain their accepted authorization evidence.
 
 The protocol is specified in the companion Eternum repository at
 `docs/architecture/sequencer-randomness-protocol.md`. `tests/fixtures/v1.txt` is byte-identical to its Cairo fixture.

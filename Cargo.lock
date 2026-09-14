@@ -9959,6 +9959,7 @@ name = "mc-sequencer-randomness"
 version = "0.10.0"
 dependencies = [
  "num-bigint",
+ "rustix 1.1.2",
  "starknet-types-core 0.2.4",
  "thiserror 2.0.17",
 ]
