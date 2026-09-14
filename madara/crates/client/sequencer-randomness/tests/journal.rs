@@ -140,6 +140,13 @@ async fn replicated_journal_rehearsal() {
     }
     journal.record_submission(action, Felt::ONE, &[1, 2, 3]).await.unwrap();
     journal.record_submission(action, Felt::TWO, &[4, 5, 6]).await.unwrap();
+    journal.authorize_submission(&record.envelope, authorization(), Felt::ONE).await.unwrap();
+    assert!(journal.authorize_submission(&record.envelope, authorization(), Felt::THREE).await.is_err());
+    assert!(journal.authorize_submission(&altered, authorization(), Felt::ONE).await.is_err());
+    let mut forged_auth = authorization();
+    forged_auth.r = Felt::ONE;
+    assert!(journal.authorize_submission(&record.envelope, forged_auth, Felt::ONE).await.is_err());
+    eprintln!("PASS submission boundary binds registered transaction, root and authorization");
     assert!(journal.record_submission(action, Felt::ONE, &[9]).await.is_err());
     drop(journal);
     admin.batch_execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='randomness_writer_2') THEN CREATE ROLE randomness_writer_2 LOGIN PASSWORD 'local-rehearsal'; END IF; END $$;

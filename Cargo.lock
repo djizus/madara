@@ -9565,6 +9565,7 @@ dependencies = [
  "mc-devnet",
  "mc-exec",
  "mc-mempool",
+ "mc-sequencer-randomness",
  "mc-settlement-client",
  "mc-submit-tx",
  "mc-telemetry",
@@ -10011,13 +10012,22 @@ dependencies = [
 name = "mc-sequencer-randomness"
 version = "0.10.0"
 dependencies = [
+ "anyhow",
+ "axum 0.7.9",
  "num-bigint",
  "rustix 1.1.2",
+ "serde",
+ "serde_json",
+ "starknet-rust-accounts",
+ "starknet-rust-core 0.19.0-rc.2",
  "starknet-rust-crypto 0.19.0-rc.2",
+ "starknet-rust-providers",
+ "starknet-rust-signers",
  "starknet-types-core 0.2.4",
  "thiserror 2.0.17",
  "tokio",
  "tokio-postgres",
+ "url",
 ]
 
 [[package]]

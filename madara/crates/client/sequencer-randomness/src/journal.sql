@@ -182,6 +182,21 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION randomness.authorize_submission(expected_epoch bigint, id bytea, tx bytea, bound bytea, auth bytea) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
+BEGIN
+    PERFORM 1 FROM randomness.stream FOR UPDATE;
+    PERFORM randomness.require_writer(expected_epoch);
+    IF NOT EXISTS (SELECT 1 FROM randomness.tickets WHERE action = id AND status = 'submitted'
+        AND binding = bound AND auth_witness = auth) THEN
+        RAISE EXCEPTION 'submission has no pending accepted ticket';
+    END IF;
+    UPDATE randomness.submissions SET epoch = expected_epoch
+        WHERE transaction_hash = tx AND action = id AND epoch = expected_epoch;
+    IF NOT FOUND THEN RAISE EXCEPTION 'unregistered or fenced transaction'; END IF;
+END;
+$$;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA randomness FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA randomness FROM PUBLIC;
 GRANT USAGE ON SCHEMA randomness TO randomness_writer_1;

@@ -95,6 +95,27 @@ impl Drop for Journal {
 }
 
 impl Journal {
+    pub async fn authorize_submission(
+        &self,
+        envelope: &Envelope,
+        authorization: Authorization,
+        transaction: Felt,
+    ) -> Result<(), JournalError> {
+        self.primary
+            .query_one(
+                "SELECT randomness.authorize_submission($1,$2,$3,$4,$5)",
+                &[
+                    &self.epoch,
+                    &envelope.action.to_bytes_be().to_vec(),
+                    &transaction.to_bytes_be().to_vec(),
+                    &envelope.binding()?.to_bytes_be().to_vec(),
+                    &encode_bytes(&[authorization.public_key, authorization.r, authorization.s]),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn connect(primary: &str, standby: &str, epoch: u64) -> Result<Self, JournalError> {
         let epoch = i64::try_from(epoch).map_err(|_| JournalError::Capacity)?;
         let (primary, primary_connection) = tokio_postgres::connect(primary, NoTls).await?;
@@ -285,6 +306,16 @@ impl Journal {
             .collect()
     }
 
+    pub async fn accepted_prefix(&self) -> Result<Vec<Record>, JournalError> {
+        self.require_standby().await?;
+        self.standby
+            .query("SELECT * FROM randomness.records($1)", &[&self.epoch])
+            .await?
+            .iter()
+            .map(decode_record)
+            .collect()
+    }
+
     async fn require_standby(&self) -> Result<(), JournalError> {
         let recovering: bool = self.standby.query_one("SELECT pg_is_in_recovery()", &[]).await?.get(0);
         if !recovering {
@@ -297,7 +328,7 @@ impl Journal {
         self.find_record(action).await?.ok_or(JournalError::Prefix)
     }
 
-    async fn find_record(&self, action: Felt) -> Result<Option<Record>, JournalError> {
+    pub async fn find_record(&self, action: Felt) -> Result<Option<Record>, JournalError> {
         self.require_standby().await?;
         let row = self
             .standby

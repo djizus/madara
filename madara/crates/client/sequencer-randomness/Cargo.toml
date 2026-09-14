@@ -9,12 +9,21 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+starknet-accounts = { workspace = true }
+starknet-providers = { workspace = true }
+starknet-signers = { workspace = true }
 rustix = { version = "=1.1.2", features = ["rand"] }
+starknet-core = { workspace = true }
 starknet-types-core = { workspace = true }
 starknet-crypto = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-postgres = "=0.7.13"
+url = { workspace = true }
 
 [dev-dependencies]
 num-bigint = { workspace = true }

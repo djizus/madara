@@ -38,11 +38,13 @@ m-cairo-test-contracts.workspace = true
 
 [features]
 testing = ["mc-db/testing", "mockall", "mc-settlement-client/testing"]
+sequencer-randomness = ["dep:mc-sequencer-randomness"]
 
 [dependencies]
 
 # Madara
 mc-db.workspace = true
+mc-sequencer-randomness = { workspace = true, optional = true }
 mc-exec.workspace = true
 mc-mempool.workspace = true
 mc-settlement-client.workspace = true

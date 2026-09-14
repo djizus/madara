@@ -168,3 +168,4 @@ zeroize.workspace = true
 
 [features]
 default = []
+sequencer-randomness = ["mc-block-production/sequencer-randomness"]

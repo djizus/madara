@@ -16,6 +16,10 @@ use mp_utils::service::ServiceContext;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "sequencer-randomness")]
+#[path = "randomness.rs"]
+mod randomness;
+
 pub struct Batcher {
     backend: Arc<MadaraBackend>,
     mempool: Arc<Mempool>,
@@ -47,6 +51,10 @@ impl Batcher {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "sequencer-randomness")]
+        let mut randomness_gate = mc_sequencer_randomness::submission::SubmissionGate::from_env(
+            self.backend.chain_config().chain_id.to_felt(),
+        )?;
         loop {
             // We use the permit API so that we don't have to remove transactions from the mempool until the last moment.
             // The buffer inside the channel is of size 1 - meaning we're preparing the next batch of transactions that will immediately be executed next, once
@@ -134,6 +142,8 @@ impl Batcher {
             };
 
             if !batch.is_empty() {
+                #[cfg(feature = "sequencer-randomness")]
+                randomness::authorize_batch(&mut randomness_gate, &batch).await?;
                 tracing::debug!("Sending batch of {} transactions to the worker thread.", batch.len());
 
                 permit.send(batch);
