@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "madara/crates/client/sequencer-randomness",
   "madara",
   "orchestrator",
   "e2e",

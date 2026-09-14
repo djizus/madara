@@ -1,0 +1,178 @@
+use starknet_types_core::{
+    felt::Felt,
+    hash::{Poseidon, StarkHash},
+};
+
+const ACTION_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f414354494f4e");
+const ENVELOPE_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f454e54524f5059");
+const VERSION: Felt = Felt::ONE;
+const MAX_ARGUMENTS: usize = 256;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProtocolError {
+    #[error("invalid action encoding")]
+    Action,
+    #[error("invalid entropy envelope")]
+    Envelope,
+    #[error("noncanonical felt bytes")]
+    Bytes,
+}
+
+/// The signed action excludes transport identifiers and the current authority epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Intent {
+    pub chain: Felt,
+    pub deployment: Felt,
+    pub game: Felt,
+    pub actor: Felt,
+    pub nonce: u64,
+    pub command: Felt,
+    pub rules: Felt,
+    pub valid_from: u64,
+    pub valid_until: u64,
+    pub last_order: u64,
+    pub arguments: Vec<Felt>,
+}
+
+impl Intent {
+    pub fn encode(&self) -> Result<Vec<Felt>, ProtocolError> {
+        if self.valid_from > self.valid_until || self.last_order == 0 || self.arguments.len() > MAX_ARGUMENTS {
+            return Err(ProtocolError::Action);
+        }
+        let mut fields = vec![
+            ACTION_TAG,
+            VERSION,
+            self.chain,
+            self.deployment,
+            self.game,
+            self.actor,
+            self.nonce.into(),
+            self.command,
+            self.rules,
+            self.valid_from.into(),
+            self.valid_until.into(),
+            self.last_order.into(),
+            Felt::from(self.arguments.len() as u64),
+        ];
+        fields.extend_from_slice(&self.arguments);
+        Ok(fields)
+    }
+
+    pub fn decode(fields: &[Felt]) -> Result<Self, ProtocolError> {
+        if fields.len() < 13 || fields[0] != ACTION_TAG || fields[1] != VERSION {
+            return Err(ProtocolError::Action);
+        }
+        let count = u64::try_from(fields[12]).map_err(|_| ProtocolError::Action)?;
+        if count > MAX_ARGUMENTS as u64 || fields.len() != 13 + count as usize {
+            return Err(ProtocolError::Action);
+        }
+        let intent = Self {
+            chain: fields[2],
+            deployment: fields[3],
+            game: fields[4],
+            actor: fields[5],
+            nonce: fields[6].try_into().map_err(|_| ProtocolError::Action)?,
+            command: fields[7],
+            rules: fields[8],
+            valid_from: fields[9].try_into().map_err(|_| ProtocolError::Action)?,
+            valid_until: fields[10].try_into().map_err(|_| ProtocolError::Action)?,
+            last_order: fields[11].try_into().map_err(|_| ProtocolError::Action)?,
+            arguments: fields[13..].to_vec(),
+        };
+        intent.encode()?;
+        Ok(intent)
+    }
+
+    pub fn identity(&self) -> Result<Felt, ProtocolError> {
+        Ok(Poseidon::hash_array(&self.encode()?))
+    }
+}
+
+/// Encoding alone does not establish acceptance. Only the journal may release a committed envelope.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Envelope {
+    pub action: Felt,
+    pub order: u64,
+    pub predecessor: Felt,
+    pub preceding_state: Felt,
+    pub timestamp: u64,
+    pub execution_config: Felt,
+    pub l2_gas: u64,
+    pub root: [u8; 32],
+}
+
+impl Envelope {
+    pub fn encode(&self) -> Result<Vec<Felt>, ProtocolError> {
+        if self.order == 0 || self.l2_gas == 0 {
+            return Err(ProtocolError::Envelope);
+        }
+        let (low, high) = root_limbs(self.root);
+        Ok(vec![
+            ENVELOPE_TAG,
+            VERSION,
+            self.action,
+            self.order.into(),
+            self.predecessor,
+            self.preceding_state,
+            self.timestamp.into(),
+            self.execution_config,
+            self.l2_gas.into(),
+            low.into(),
+            high.into(),
+        ])
+    }
+
+    pub fn decode(fields: &[Felt]) -> Result<Self, ProtocolError> {
+        if fields.len() != 11 || fields[0] != ENVELOPE_TAG || fields[1] != VERSION {
+            return Err(ProtocolError::Envelope);
+        }
+        let low: u128 = fields[9].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let high: u128 = fields[10].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let mut root = [0; 32];
+        root[..16].copy_from_slice(&high.to_be_bytes());
+        root[16..].copy_from_slice(&low.to_be_bytes());
+        let envelope = Self {
+            action: fields[2],
+            order: fields[3].try_into().map_err(|_| ProtocolError::Envelope)?,
+            predecessor: fields[4],
+            preceding_state: fields[5],
+            timestamp: fields[6].try_into().map_err(|_| ProtocolError::Envelope)?,
+            execution_config: fields[7],
+            l2_gas: fields[8].try_into().map_err(|_| ProtocolError::Envelope)?,
+            root,
+        };
+        envelope.encode()?;
+        Ok(envelope)
+    }
+
+    pub fn binding(&self) -> Result<Felt, ProtocolError> {
+        Ok(Poseidon::hash_array(&self.encode()?))
+    }
+}
+
+pub fn root_limbs(root: [u8; 32]) -> (u128, u128) {
+    let high = u128::from_be_bytes(root[..16].try_into().expect("fixed root half"));
+    let low = u128::from_be_bytes(root[16..].try_into().expect("fixed root half"));
+    (low, high)
+}
+
+pub fn encode_bytes(fields: &[Felt]) -> Vec<u8> {
+    fields.iter().flat_map(Felt::to_bytes_be).collect()
+}
+
+pub fn decode_bytes(bytes: &[u8]) -> Result<Vec<Felt>, ProtocolError> {
+    if bytes.len() % 32 != 0 {
+        return Err(ProtocolError::Bytes);
+    }
+    bytes
+        .chunks_exact(32)
+        .map(|chunk| {
+            let bytes: [u8; 32] = chunk.try_into().expect("fixed chunk size");
+            let felt = Felt::from_bytes_be(&bytes);
+            if felt.to_bytes_be() != bytes {
+                return Err(ProtocolError::Bytes);
+            }
+            Ok(felt)
+        })
+        .collect()
+}

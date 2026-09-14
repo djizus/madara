@@ -1,0 +1,16 @@
+[package]
+name = "mc-sequencer-randomness"
+description = "Recorded entropy bound to ordered Eternum actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starknet-types-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+num-bigint = { workspace = true }
