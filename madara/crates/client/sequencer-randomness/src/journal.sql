@@ -152,33 +152,11 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION randomness.records(expected_epoch bigint) RETURNS SETOF randomness.tickets
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
-BEGIN
-    PERFORM randomness.require_writer(expected_epoch);
-    IF EXISTS (SELECT 1 FROM randomness.tickets WHERE integrity <> sha256(intent || context || auth_witness
-        || coalesce(envelope, ''::bytea) || coalesce(binding, ''::bytea) || coalesce(result, ''::bytea)
-        || coalesce(following_state, ''::bytea)
-        || CASE WHEN rejected IS NULL THEN ''::bytea WHEN rejected THEN decode('01','hex') ELSE decode('00','hex') END)) THEN
-        RAISE EXCEPTION 'corrupted journal entry';
-    END IF;
-    RETURN QUERY SELECT * FROM randomness.tickets ORDER BY ticket_order;
-END;
-$$;
-
 CREATE FUNCTION randomness.head(expected_epoch bigint) RETURNS SETOF randomness.stream
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
 BEGIN
     PERFORM randomness.require_writer(expected_epoch);
     RETURN QUERY SELECT * FROM randomness.stream;
-END;
-$$;
-
-CREATE FUNCTION randomness.pending_submissions(expected_epoch bigint) RETURNS SETOF randomness.submissions
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
-BEGIN
-    PERFORM randomness.require_writer(expected_epoch);
-    RETURN QUERY SELECT * FROM randomness.submissions ORDER BY transaction_hash;
 END;
 $$;
 

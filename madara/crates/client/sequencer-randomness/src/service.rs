@@ -272,7 +272,7 @@ impl Service {
     }
 
     async fn submit(&self, record: &Record) -> anyhow::Result<Felt> {
-        let retained = self.journal.submissions().await?;
+        let retained = self.journal.submissions(record.envelope.action).await?;
         for submission in retained.iter().filter(|submission| submission.action == record.envelope.action) {
             match self.account.provider().get_transaction_status(submission.transaction_hash).await {
                 Ok(status) => {

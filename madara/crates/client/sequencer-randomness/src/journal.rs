@@ -1,11 +1,11 @@
 use crate::protocol::{decode_bytes, encode_bytes, Envelope, Intent, ProtocolError};
-use crate::ticket::{Context, State, Ticket, TicketError, Tickets};
+use crate::ticket::{Context, State, Ticket, TicketError};
 use starknet_types_core::felt::Felt;
 use std::collections::HashSet;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, IsolationLevel, NoTls, Row};
 
-pub const SCHEMA: &str = include_str!("journal.sql");
+pub const SCHEMA: &str = concat!(include_str!("journal.sql"), include_str!("journal-lookup.sql"));
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -83,7 +83,6 @@ pub struct Journal {
     standby: Client,
     connections: Vec<JoinHandle<Result<(), tokio_postgres::Error>>>,
     epoch: i64,
-    tickets: Tickets,
 }
 
 impl Drop for Journal {
@@ -125,7 +124,6 @@ impl Journal {
             standby,
             connections: vec![tokio::spawn(primary_connection), tokio::spawn(standby_connection)],
             epoch,
-            tickets: Tickets::default(),
         };
         journal.require_standby().await?;
         Ok(journal)
@@ -149,26 +147,23 @@ impl Journal {
         }
         let reservation_ms = reserve_started.elapsed().as_secs_f64() * 1000.0;
         let sample_started = std::time::Instant::now();
-        let envelope = self.sample_proposal(intent, context)?;
+        let mut ticket = Ticket::propose(intent, context)?;
+        ticket.sample_os()?;
         let sampling_ms = sample_started.elapsed().as_secs_f64() * 1000.0;
         let commit_started = std::time::Instant::now();
-        self.commit_binding(&envelope).await?;
+        self.commit_binding(ticket.envelope_for_journal()?).await?;
         let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
         let witness_started = std::time::Instant::now();
         let record = self.accepted_record(action).await?;
-        self.acknowledge_binding(&record)?;
+        ticket.committed()?;
+        if ticket.envelope()? != &record.envelope {
+            return Err(JournalError::Prefix);
+        }
         // Sampling timings are published only after the complete binding is acknowledged.
         tracing::info!(target: "sequencer_randomness", action = %action.to_hex_string(), order = record.envelope.order,
             reservation_ms, sampling_ms, commit_ms, witness_ms = witness_started.elapsed().as_secs_f64() * 1000.0,
             "randomness_journal");
         Ok(record)
-    }
-
-    fn sample_proposal(&mut self, intent: Intent, context: Context) -> Result<Envelope, JournalError> {
-        // reserve() has completed remote_apply before any OS call. An ambiguous return never reaches sampling.
-        let ticket = self.tickets.propose(intent, context)?;
-        ticket.sample_os()?;
-        Ok(ticket.envelope_for_journal()?.clone())
     }
 
     async fn commit_binding(&self, envelope: &Envelope) -> Result<(), JournalError> {
@@ -180,15 +175,6 @@ impl Journal {
                 &[&self.epoch, &envelope.action.to_bytes_be().to_vec(), &bytes, &binding],
             )
             .await?;
-        Ok(())
-    }
-
-    fn acknowledge_binding(&mut self, record: &Record) -> Result<(), JournalError> {
-        let ticket = self.tickets.propose(record.intent.clone(), context_from_envelope(&record.envelope))?;
-        ticket.committed()?;
-        if ticket.envelope()? != &record.envelope {
-            return Err(JournalError::Prefix);
-        }
         Ok(())
     }
 
@@ -300,10 +286,13 @@ impl Journal {
         Ok(records)
     }
 
-    pub async fn submissions(&self) -> Result<Vec<Submission>, JournalError> {
+    pub async fn submissions(&self, action: Felt) -> Result<Vec<Submission>, JournalError> {
         self.require_standby().await?;
         self.standby
-            .query("SELECT * FROM randomness.pending_submissions($1)", &[&self.epoch])
+            .query(
+                "SELECT * FROM randomness.pending_submissions($1,$2)",
+                &[&self.epoch, &action.to_bytes_be().to_vec()],
+            )
             .await?
             .iter()
             .map(|row| {
@@ -343,10 +332,7 @@ impl Journal {
         self.require_standby().await?;
         let row = self
             .standby
-            .query_opt(
-                "SELECT * FROM randomness.records($1) WHERE action = $2",
-                &[&self.epoch, &action.to_bytes_be().to_vec()],
-            )
+            .query_opt("SELECT * FROM randomness.records($1,$2)", &[&self.epoch, &action.to_bytes_be().to_vec()])
             .await?;
         row.as_ref().map(decode_record).transpose()
     }

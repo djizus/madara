@@ -6,9 +6,18 @@ use mc_sequencer_randomness::{
 use starknet_types_core::felt::Felt;
 use tokio_postgres::{Client, NoTls};
 
-const PRIMARY: &str = "host=127.0.0.1 port=55432 dbname=randomness user=randomness_writer_1 password=local-rehearsal";
-const STANDBY: &str = "host=127.0.0.1 port=55433 dbname=randomness user=randomness_writer_1 password=local-rehearsal";
-const ADMIN: &str = "host=127.0.0.1 port=55432 dbname=randomness user=postgres password=local-rehearsal";
+const DEFAULT_PRIMARY: &str =
+    "host=127.0.0.1 port=55432 dbname=randomness user=randomness_writer_1 password=local-rehearsal";
+const DEFAULT_STANDBY: &str =
+    "host=127.0.0.1 port=55433 dbname=randomness user=randomness_writer_1 password=local-rehearsal";
+const DEFAULT_ADMIN: &str = "host=127.0.0.1 port=55432 dbname=randomness user=postgres password=local-rehearsal";
+
+static PRIMARY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("RANDOMNESS_TEST_PRIMARY").unwrap_or_else(|_| DEFAULT_PRIMARY.into()));
+static STANDBY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("RANDOMNESS_TEST_STANDBY").unwrap_or_else(|_| DEFAULT_STANDBY.into()));
+static ADMIN: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("RANDOMNESS_TEST_ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.into()));
 
 async fn client(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
@@ -54,11 +63,11 @@ fn authorization() -> Authorization {
 #[tokio::test]
 #[ignore = "requires the isolated madara-rand synchronous PostgreSQL pair; replaces only its rehearsal schema"]
 async fn replicated_journal_rehearsal() {
-    let admin = client(ADMIN).await;
+    let admin = client(&ADMIN).await;
     admin.query_one("SELECT pg_advisory_lock(4995003)", &[]).await.unwrap();
     admin.batch_execute("DROP SCHEMA IF EXISTS randomness CASCADE").await.unwrap();
     admin.batch_execute(SCHEMA).await.unwrap();
-    let mut journal = Journal::connect(PRIMARY, STANDBY, 1).await.unwrap();
+    let mut journal = Journal::connect(&PRIMARY, &STANDBY, 1).await.unwrap();
     assert!(journal.recover(&[]).await.unwrap().is_empty());
     let mut forged = authorization();
     forged.r = Felt::ONE;
@@ -67,7 +76,7 @@ async fn replicated_journal_rehearsal() {
     let workers: Vec<_> = (0..16)
         .map(|_| {
             tokio::spawn(async {
-                let mut contender = Journal::connect(PRIMARY, STANDBY, 1).await.unwrap();
+                let mut contender = Journal::connect(&PRIMARY, &STANDBY, 1).await.unwrap();
                 for _ in 0..1000 {
                     match contender.accept(intent(), context(), authorization()).await {
                         Ok(record) => return record,
@@ -98,7 +107,7 @@ async fn replicated_journal_rehearsal() {
     assert!(journal.accept(changed, context(), authorization()).await.is_err());
     eprintln!("PASS replicated acceptance, duplicate identity, conflicting nonce, fixed context");
 
-    let writer = client(PRIMARY).await;
+    let writer = client(&PRIMARY).await;
     assert!(writer.execute("UPDATE randomness.tickets SET envelope = NULL", &[]).await.is_err());
     let mut altered = record.envelope.clone();
     altered.root[0] ^= 1;
@@ -114,7 +123,7 @@ async fn replicated_journal_rehearsal() {
         )
         .await
         .is_err());
-    let stale = Journal::connect(PRIMARY, STANDBY, 2).await.unwrap();
+    let stale = Journal::connect(&PRIMARY, &STANDBY, 2).await.unwrap();
     assert!(stale.record_submission(action, Felt::ONE, &[1]).await.is_err());
     assert!(stale.finish(action, Felt::ONE, Felt::ONE, false).await.is_err());
     assert!(stale.consume(action).await.is_err());
@@ -123,7 +132,7 @@ async fn replicated_journal_rehearsal() {
     let workers: Vec<_> = (0..16)
         .map(|_| {
             tokio::spawn(async {
-                Journal::connect(PRIMARY, STANDBY, 1)
+                Journal::connect(&PRIMARY, &STANDBY, 1)
                     .await
                     .unwrap()
                     .accept(intent(), context(), authorization())
@@ -163,8 +172,10 @@ async fn replicated_journal_rehearsal() {
             .unwrap();
     assert_eq!(restarted.recover(&[]).await.unwrap()[0].envelope.binding().unwrap(), binding);
     eprintln!("PASS writer credential rotation preserves pending identity and fences the former role");
-    let submissions = restarted.submissions().await.unwrap();
+    let submissions = restarted.submissions(record.envelope.action).await.unwrap();
     assert_eq!(submissions.len(), 2);
+    assert!(restarted.submissions(Felt::from(999_u64)).await.unwrap().is_empty());
+    assert!(restarted.find_record(Felt::from(999_u64)).await.unwrap().is_none());
     assert_eq!(submissions[0].bytes, vec![1, 2, 3]);
     assert_eq!(submissions[1].bytes, vec![4, 5, 6]);
     eprintln!("PASS concurrent duplicates and restart with two unresolved submission hashes");
@@ -184,6 +195,7 @@ async fn replicated_journal_rehearsal() {
         .await
         .unwrap();
     assert!(restarted.recover(&chain).await.is_err());
+    assert!(restarted.find_record(action).await.is_err());
     admin.execute("DELETE FROM randomness.submissions", &[]).await.unwrap();
     admin.execute("DELETE FROM randomness.tickets", &[]).await.unwrap();
     assert!(restarted.recover(&[]).await.is_err());
@@ -220,7 +232,7 @@ async fn replicated_journal_rehearsal() {
         )
         .await
         .unwrap();
-    let mut restarted = Journal::connect(PRIMARY, STANDBY, 1).await.unwrap();
+    let mut restarted = Journal::connect(&PRIMARY, &STANDBY, 1).await.unwrap();
     assert!(matches!(
         restarted.accept(intent(), context(), authorization()).await,
         Err(JournalError::UnresolvedProposal)
@@ -229,7 +241,7 @@ async fn replicated_journal_rehearsal() {
     eprintln!("PASS durable sampling reservation without a recoverable root never samples again");
     admin.batch_execute("DROP SCHEMA randomness CASCADE").await.unwrap();
     admin.batch_execute(SCHEMA).await.unwrap();
-    let connection = client(PRIMARY).await;
+    let connection = client(&PRIMARY).await;
     let paused = PausedStandby::new();
     let reservation = async {
         connection
@@ -250,7 +262,7 @@ async fn replicated_journal_rehearsal() {
     assert!(tokio::time::timeout(std::time::Duration::from_millis(500), reservation).await.is_err());
     drop(paused);
     connection.simple_query("SELECT 1").await.unwrap();
-    let mut restarted = Journal::connect(PRIMARY, STANDBY, 1).await.unwrap();
+    let mut restarted = Journal::connect(&PRIMARY, &STANDBY, 1).await.unwrap();
     assert!(matches!(
         restarted.accept(intent(), context(), authorization()).await,
         Err(JournalError::UnresolvedProposal)
@@ -258,23 +270,18 @@ async fn replicated_journal_rehearsal() {
     eprintln!("PASS standby loss prevents commit acknowledgement; ambiguous reservation never resamples");
 }
 
-struct PausedStandby;
+struct PausedStandby(String);
 impl PausedStandby {
     fn new() -> Self {
-        assert!(std::process::Command::new("docker")
-            .args(["pause", "madara-rand-journal-standby-1"])
-            .status()
-            .unwrap()
-            .success());
-        Self
+        let container = std::env::var("RANDOMNESS_TEST_STANDBY_CONTAINER")
+            .unwrap_or_else(|_| "madara-rand-journal-standby-1".into());
+        assert!(container.starts_with("madara-rand-journal-"));
+        assert!(std::process::Command::new("docker").args(["pause", &container]).status().unwrap().success());
+        Self(container)
     }
 }
 impl Drop for PausedStandby {
     fn drop(&mut self) {
-        assert!(std::process::Command::new("docker")
-            .args(["unpause", "madara-rand-journal-standby-1"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(std::process::Command::new("docker").args(["unpause", &self.0]).status().unwrap().success());
     }
 }

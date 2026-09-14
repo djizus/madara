@@ -1,6 +1,5 @@
 use crate::protocol::{Envelope, Intent, ProtocolError};
 use starknet_types_core::felt::Felt;
-use std::collections::{hash_map::Entry, HashMap};
 
 pub const MAX_CONTEXT_SKEW_SECONDS: u64 = 300;
 
@@ -30,29 +29,6 @@ pub enum TicketError {
     Transition,
     #[error("conflicting result")]
     ConflictingResult,
-    #[error("actor nonce is already reserved for another intent")]
-    NonceConflict,
-}
-
-/// Live admission serialization. The journal provides durable reservation and reloads this working set.
-#[derive(Default)]
-pub struct Tickets {
-    records: HashMap<[Felt; 5], Ticket>,
-}
-
-impl Tickets {
-    pub fn propose(&mut self, intent: Intent, context: Context) -> Result<&mut Ticket, TicketError> {
-        let key = [intent.chain, intent.deployment, intent.game, intent.actor, intent.nonce.into()];
-        match self.records.entry(key) {
-            Entry::Occupied(entry) => {
-                if entry.get().intent != intent {
-                    return Err(TicketError::NonceConflict);
-                }
-                Ok(entry.into_mut())
-            }
-            Entry::Vacant(entry) => Ok(entry.insert(Ticket::propose(intent, context)?)),
-        }
-    }
 }
 
 /// No root is present in a proposal's execution context.
@@ -141,10 +117,6 @@ impl Ticket {
             submissions: Vec::new(),
             result: None,
         })
-    }
-
-    pub fn state(&self) -> State {
-        self.state
     }
 
     pub fn sample_os(&mut self) -> Result<(), TicketError> {
@@ -296,10 +268,32 @@ mod tests {
             assert_eq!(ticket.finish(outcome, Felt::ONE), Err(TicketError::ConflictingResult));
             ticket.consume().unwrap();
             ticket.consume().unwrap();
-            assert_eq!(ticket.state(), State::Consumed);
+            assert_eq!(ticket.state, State::Consumed);
             assert_eq!(ticket.envelope().unwrap().binding().unwrap(), binding);
             assert_eq!(ticket.sample_os(), Err(TicketError::AlreadySampled));
         }
+    }
+
+    #[test]
+    fn recovery_at_every_accepted_state_keeps_the_binding_and_cannot_sample() {
+        let original = sampled();
+        let envelope = original.envelope_for_journal().unwrap().clone();
+        for state in [State::Committed, State::Submitted, State::Executed, State::TerminalRejected, State::Consumed] {
+            let result =
+                matches!(state, State::Executed | State::TerminalRejected | State::Consumed).then_some(Felt::THREE);
+            let mut recovered = Ticket::restore(original.intent.clone(), envelope.clone(), state, result).unwrap();
+            assert_eq!(recovered.state, state);
+            assert!(recovered.envelope().unwrap() == &envelope);
+            assert_eq!(
+                recovered.sample_with(|_| panic!("recovery invoked the entropy source")),
+                Err(TicketError::AlreadySampled)
+            );
+            assert_eq!(recovered.envelope().unwrap().binding(), envelope.binding());
+        }
+        assert!(matches!(
+            Ticket::restore(original.intent, envelope, State::Proposed, None),
+            Err(TicketError::Transition)
+        ));
     }
 
     #[test]
@@ -371,49 +365,6 @@ mod tests {
             assert_eq!(ticket.context.validate(&ticket.intent).is_ok(), vector[7] == 1);
             assert_eq!(timestamp_in_bounds(vector[0], vector[1]), vector[8] == 1);
         }
-    }
-
-    #[test]
-    fn concurrent_duplicates_and_conflicting_nonce_converge_without_resampling() {
-        use std::sync::{Arc, Mutex};
-        let tickets = Arc::new(Mutex::new(Tickets::default()));
-        let workers: Vec<_> = (0..16)
-            .map(|_| {
-                let tickets = Arc::clone(&tickets);
-                std::thread::spawn(move || {
-                    let input = proposal();
-                    let mut locked = tickets.lock().unwrap();
-                    let ticket = locked.propose(input.intent, input.context).unwrap();
-                    if ticket.state() == State::Proposed {
-                        ticket.sample_os().unwrap();
-                        ticket.committed().unwrap();
-                    }
-                    ticket.envelope().unwrap().binding().unwrap()
-                })
-            })
-            .collect();
-        let bindings: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-        assert!(bindings.iter().all(|binding| *binding == bindings[0]));
-        let mut input = proposal();
-        input.intent.arguments.push(Felt::ONE);
-        assert!(matches!(
-            tickets.lock().unwrap().propose(input.intent, input.context),
-            Err(TicketError::NonceConflict)
-        ));
-        let mut input = proposal();
-        input.context.timestamp = u64::MAX;
-        assert_eq!(
-            tickets
-                .lock()
-                .unwrap()
-                .propose(input.intent, input.context)
-                .unwrap()
-                .envelope()
-                .unwrap()
-                .binding()
-                .unwrap(),
-            bindings[0]
-        );
     }
 
     #[test]
