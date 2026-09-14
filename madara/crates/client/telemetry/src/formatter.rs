@@ -169,15 +169,14 @@ impl Visit for CairoNativeEventVisitor {
     }
 }
 
-/// Visitor that collects all fields from a close_block event into a JSON
-/// object.
+/// Collect structured timing fields without converting numbers to display text.
 #[derive(Default)]
-struct CloseBlockEventVisitor {
+struct StructuredEventVisitor {
     fields: Vec<(String, serde_json::Value)>,
     message: String,
 }
 
-impl Visit for CloseBlockEventVisitor {
+impl Visit for StructuredEventVisitor {
     fn record_u64(&mut self, field: &Field, value: u64) {
         self.fields.push((field.name().to_string(), serde_json::Value::Number(value.into())));
     }
@@ -573,8 +572,8 @@ impl CustomFormatter {
         }
     }
 
-    /// Format close_block events as JSON for Loki ingestion.
-    fn format_close_block(
+    /// Preserve structured block and action measurements as JSON.
+    fn format_structured(
         &self,
         writer: &mut Writer<'_>,
         event: &tracing::Event<'_>,
@@ -582,7 +581,7 @@ impl CustomFormatter {
         level: &Level,
         target: &str,
     ) -> fmt::Result {
-        let mut visitor = CloseBlockEventVisitor::default();
+        let mut visitor = StructuredEventVisitor::default();
         event.record(&mut visitor);
 
         // Build a JSON object with timestamp, level, target, and all captured
@@ -630,7 +629,9 @@ where
                 self.format_http_call(&mut writer, event, target, &ts, level)
             }
             (_, "madara_cairo_native") => self.format_cairo_native(&mut writer, event, &ts, level),
-            (_, "close_block") => self.format_close_block(&mut writer, event, &ts, level, target),
+            (_, "close_block" | "execution_measurement" | "sequencer_randomness") => {
+                self.format_structured(&mut writer, event, &ts, level, target)
+            }
             (&Level::INFO, _) => self.format_without_target(&mut writer, event, &ts, level, &Style::new().green()),
             (&Level::WARN, _) => {
                 self.format_with_target(&mut writer, event, target, &ts, level, &Style::new().yellow())

@@ -272,6 +272,13 @@ impl CurrentBlockState {
             }
         }
 
+        let persisted_transactions: Vec<_> = executed
+            .iter()
+            .map(|transaction| {
+                (*transaction.transaction.receipt.transaction_hash(), transaction.transaction.receipt.events().len())
+            })
+            .collect();
+        let persistence_started = Instant::now();
         let backend = self.backend.clone();
         global_spawn_rayon_task(move || {
             backend
@@ -280,6 +287,12 @@ impl CurrentBlockState {
                 .context("Appending to preconfirmed block")
         })
         .await?;
+        let batch_persistence_ms = persistence_started.elapsed().as_secs_f64() * 1000.0;
+        for (transaction, event_count) in &persisted_transactions {
+            tracing::info!(target: "execution_measurement", transaction = %format!("{transaction:#x}"),
+                block_number = self.block_number, batch_count = persisted_transactions.len(), event_count,
+                batch_persistence_ms, "preconfirmed_persistence");
+        }
 
         let stats = mem::take(&mut batch.stats);
         if stats.n_added_to_block > 0 {

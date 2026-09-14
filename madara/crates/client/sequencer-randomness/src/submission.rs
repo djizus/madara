@@ -48,6 +48,7 @@ impl SubmissionGate {
     }
 
     pub async fn authorize(&mut self, hash: Felt, calldata: &[Felt], l2_gas: u64, query: bool) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
             bail!("embedded admission worker stopped; recovery required");
         }
@@ -74,6 +75,9 @@ impl SubmissionGate {
                 hash,
             )
             .await?;
+        tracing::info!(target: "sequencer_randomness", action = %execution.envelope.action.to_hex_string(),
+            order = execution.envelope.order, transaction = %hash.to_hex_string(),
+            checks_ms = started.elapsed().as_secs_f64() * 1000.0, "randomness_submission_checks");
         Ok(())
     }
 }

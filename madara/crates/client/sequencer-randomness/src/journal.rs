@@ -143,13 +143,24 @@ impl Journal {
         }
         context.validate(&intent)?;
         authorization.verify(action)?;
+        let reserve_started = std::time::Instant::now();
         if !self.reserve_sampling(&intent, &context, authorization).await? {
             return self.accepted_record(action).await;
         }
+        let reservation_ms = reserve_started.elapsed().as_secs_f64() * 1000.0;
+        let sample_started = std::time::Instant::now();
         let envelope = self.sample_proposal(intent, context)?;
+        let sampling_ms = sample_started.elapsed().as_secs_f64() * 1000.0;
+        let commit_started = std::time::Instant::now();
         self.commit_binding(&envelope).await?;
+        let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+        let witness_started = std::time::Instant::now();
         let record = self.accepted_record(action).await?;
         self.acknowledge_binding(&record)?;
+        // Sampling timings are published only after the complete binding is acknowledged.
+        tracing::info!(target: "sequencer_randomness", action = %action.to_hex_string(), order = record.envelope.order,
+            reservation_ms, sampling_ms, commit_ms, witness_ms = witness_started.elapsed().as_secs_f64() * 1000.0,
+            "randomness_journal");
         Ok(record)
     }
 

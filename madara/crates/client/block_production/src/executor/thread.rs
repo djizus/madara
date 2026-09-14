@@ -478,6 +478,13 @@ impl ExecutorThread {
                 match res {
                     Ok((execution_info, _state_diff)) => {
                         tracing::trace!("Successful execution of transaction {:#x}", btx.tx_hash().to_felt());
+                        tracing::info!(target: "execution_measurement",
+                            transaction = %format!("{:#x}", btx.tx_hash().to_felt()),
+                            batch_count = blockifier_results.len(),
+                            batch_execution_ms = exec_duration.as_secs_f64() * 1000.0,
+                            amortized_execution_ms = avg_tx_time_ms,
+                            l2_gas = execution_info.receipt.gas.l2_gas.0,
+                            reverted = execution_info.revert_error.is_some(), "execution_batch_member");
 
                         // Record tx execution time metric with production context.
                         exec_metrics().record_tx_execution_time(

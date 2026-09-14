@@ -17,7 +17,10 @@ use starknet_core::{
 };
 use starknet_providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, ProviderError};
 use starknet_signers::{LocalWallet, SigningKey};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
 
 type Sequencer = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
@@ -65,6 +68,7 @@ struct Accepted {
 struct AdmissionRequest {
     action: ActionRequest,
     response: oneshot::Sender<Result<Accepted, StatusCode>>,
+    received: Instant,
 }
 
 struct Service {
@@ -108,13 +112,16 @@ async fn admit(
     Json(action): Json<ActionRequest>,
 ) -> Result<Json<Accepted>, StatusCode> {
     let (response, receiver) = oneshot::channel();
-    sender.try_send(AdmissionRequest { action, response }).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    sender
+        .try_send(AdmissionRequest { action, response, received: Instant::now() })
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     receiver.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.map(Json)
 }
 
 impl Service {
     async fn work(&mut self, mut receiver: mpsc::Receiver<AdmissionRequest>) -> anyhow::Result<()> {
         while let Some(request) = receiver.recv().await {
+            let queue_ms = request.received.elapsed().as_secs_f64() * 1000.0;
             // Invalid intent never enters the journal. Storage or execution ambiguity stops the worker.
             let intent = match Intent::decode(&request.action.intent) {
                 Ok(intent) => intent,
@@ -127,6 +134,9 @@ impl Service {
                 let _ = request.response.send(Err(StatusCode::BAD_REQUEST));
                 continue;
             };
+            tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+                order = record.envelope.order, queue_ms, admission_ms = request.received.elapsed().as_secs_f64() * 1000.0,
+                "randomness_admission");
             let _ =
                 request.response.send(Ok(Accepted { action: record.envelope.action, order: record.envelope.order }));
             self.execute(record).await?;
@@ -150,6 +160,7 @@ impl Service {
     }
 
     async fn accept(&mut self, intent: Intent, r: Felt, s: Felt) -> anyhow::Result<Option<Record>> {
+        let started = Instant::now();
         if let Some(record) = self.journal.find_record(intent.identity()?).await? {
             return Ok(Some(record));
         }
@@ -196,7 +207,11 @@ impl Service {
         {
             return Ok(None);
         }
-        Ok(Some(self.journal.accept(intent, context, Authorization { public_key: *key, r, s }).await?))
+        let checks_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let record = self.journal.accept(intent, context, Authorization { public_key: *key, r, s }).await?;
+        tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+            order = record.envelope.order, checks_ms, "randomness_admission_checks");
+        Ok(Some(record))
     }
 
     async fn result(&self, order: u64) -> anyhow::Result<Option<(ChainProgress, bool)>> {
@@ -291,6 +306,7 @@ impl Service {
     }
 
     async fn prepare_submission(&self, record: &Record) -> anyhow::Result<Felt> {
+        let started = Instant::now();
         let nonce = self.account.get_nonce().await?;
         let (hash, transaction) = self.prepare_transaction(record, nonce).await?;
         self.journal.record_submission(record.envelope.action, hash, &serde_json::to_vec(&transaction)?).await?;
@@ -298,6 +314,9 @@ impl Service {
         if received.transaction_hash != hash {
             bail!("submission hash mismatch");
         }
+        tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+            order = record.envelope.order, transaction = %hash.to_hex_string(),
+            submission_ms = started.elapsed().as_secs_f64() * 1000.0, "randomness_submission");
         Ok(hash)
     }
 
@@ -329,11 +348,15 @@ impl Service {
     }
 
     async fn complete(&self, record: &Record, progress: ChainProgress, rejected: bool) -> anyhow::Result<()> {
+        let started = Instant::now();
         if progress.binding != record.envelope.binding()? {
             bail!("chain binding mismatch");
         }
         self.journal.finish(record.envelope.action, progress.result, progress.state, rejected).await?;
         self.journal.consume(record.envelope.action).await?;
+        tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+            order = record.envelope.order, persistence_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "randomness_result_persistence");
         Ok(())
     }
 }
