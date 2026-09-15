@@ -183,7 +183,7 @@ impl Service {
         let [key, rules, config, nonce, order, predecessor, state, observed_time] = fields.as_slice() else {
             bail!("malformed native admission context");
         };
-        if *rules != intent.rules || *nonce != Felt::from(intent.nonce) {
+        if !admission_state_matches(&intent, *rules, *nonce) {
             return Ok(None);
         }
         // Pending RPC calls and headers can synthesize wall time ahead of the batcher.
@@ -363,6 +363,10 @@ impl Service {
     }
 }
 
+fn admission_state_matches(intent: &Intent, rules: Felt, nonce: Felt) -> bool {
+    rules == intent.rules && nonce == Felt::from(intent.nonce) && intent.nonce < u64::MAX
+}
+
 fn admission_time_is_valid(intent: &Intent, recorded: u64, observed: u64) -> bool {
     timestamp_in_bounds(recorded, observed) && recorded >= intent.valid_from && observed <= intent.valid_until
 }
@@ -420,6 +424,29 @@ mod tests {
         assert!(!admission_time_is_valid(&intent, 999, 1005));
         assert!(!admission_time_is_valid(&intent, 1006, 1005));
         assert!(timestamp_in_bounds(1005, 1005 + 86400));
+    }
+
+    #[test]
+    fn admission_requires_the_current_nonce_with_a_representable_successor() {
+        let mut intent = Intent {
+            chain: Felt::ONE,
+            deployment: Felt::ONE,
+            game: Felt::ONE,
+            actor: Felt::ONE,
+            nonce: 7,
+            command: Felt::ONE,
+            rules: Felt::ONE,
+            valid_from: 1000,
+            valid_until: 1010,
+            last_order: 10,
+            arguments: vec![],
+        };
+        assert!(admission_state_matches(&intent, Felt::ONE, Felt::from(7)));
+        assert!(!admission_state_matches(&intent, Felt::ONE, Felt::from(8)));
+        assert!(!admission_state_matches(&intent, Felt::ONE, Felt::from(6)));
+        assert!(!admission_state_matches(&intent, Felt::TWO, Felt::from(7)));
+        intent.nonce = u64::MAX;
+        assert!(!admission_state_matches(&intent, Felt::ONE, Felt::from(u64::MAX)));
     }
 
     #[test]
