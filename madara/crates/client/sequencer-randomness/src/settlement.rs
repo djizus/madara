@@ -11,6 +11,7 @@ use starknet_types_core::hash::{Poseidon, StarkHash};
 /// The schema fixes the command layout; accepted arguments already persist in the journal.
 pub(crate) struct SettlementChecks {
     tag: Felt,
+    season_tag: Felt,
     l2: Option<JsonRpcClient<HttpTransport>>,
 }
 
@@ -45,14 +46,27 @@ impl SettlementChecks {
                 ("attributes", "core::integer::u128"),
             ],
         )?;
+        let season_tag = commands
+            .iter()
+            .position(|variant| variant["name"] == "SettleSeason")
+            .context("missing season settlement command")?;
+        require_members(
+            types,
+            commands[season_tag]["type"].as_str().context("missing season settlement payload")?,
+            &[
+                ("name", "core::felt252"),
+                ("owner", "core::starknet::contract_address::ContractAddress"),
+                ("selected_realm", "core::option::Option::<core::integer::u32>"),
+            ],
+        )?;
         let l2 = l2
             .map(|url| Ok::<_, anyhow::Error>(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>()?))))
             .transpose()?;
-        Ok(Self { tag: Felt::from(tag as u64), l2 })
+        Ok(Self { tag: Felt::from(tag as u64), season_tag: Felt::from(season_tag as u64), l2 })
     }
 
     pub(crate) fn is_settlement(&self, intent: &Intent) -> bool {
-        intent.arguments.first() == Some(&self.tag)
+        intent.arguments.first().is_some_and(|tag| *tag == self.tag || *tag == self.season_tag)
     }
 
     /// Called only for a new proposal. Recovery reads the retained arguments without external calls.
@@ -63,11 +77,14 @@ impl SettlementChecks {
     }
 
     async fn verify_claims(&self, intent: &Intent, policy: &[Felt]) -> Result<bool> {
-        let Some(claims) = Claims::decode(intent) else {
-            return Ok(false);
-        };
         let [owner, collection, timelock, limit, _game_end] = policy else {
             bail!("malformed settlement admission policy");
+        };
+        if intent.arguments.first() == Some(&self.season_tag) {
+            return Ok(season_owner(intent).is_some_and(|claimed| claimed == *owner && *owner != Felt::ZERO));
+        }
+        let Some(claims) = Claims::decode(intent) else {
+            return Ok(false);
         };
         if claims.owner != *owner || *owner == Felt::ZERO {
             return Ok(false);
@@ -137,10 +154,7 @@ struct Claims {
 }
 impl Claims {
     fn decode(intent: &Intent) -> Option<Self> {
-        const COMMAND_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f434f4d4d414e44");
-        let mut commitment = vec![COMMAND_TAG, Felt::ONE];
-        commitment.extend_from_slice(&intent.arguments);
-        if Poseidon::hash_array(&commitment) != intent.command {
+        if !command_matches(intent) {
             return None;
         }
         let fields = &intent.arguments;
@@ -158,6 +172,24 @@ impl Claims {
             })
             .collect::<Option<Vec<_>>>()?;
         Some(Self { owner: fields[2], block_hash: fields[3], block_number: fields[4].try_into().ok()?, tokens })
+    }
+}
+
+fn command_matches(intent: &Intent) -> bool {
+    const COMMAND_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f434f4d4d414e44");
+    let mut commitment = vec![COMMAND_TAG, Felt::ONE];
+    commitment.extend_from_slice(&intent.arguments);
+    Poseidon::hash_array(&commitment) == intent.command
+}
+
+fn season_owner(intent: &Intent) -> Option<Felt> {
+    if !command_matches(intent) {
+        return None;
+    }
+    match intent.arguments.as_slice() {
+        [_, _, owner, option] if *option == Felt::ONE => Some(*owner),
+        [_, _, owner, option, realm] if *option == Felt::ZERO && u32::try_from(*realm).is_ok() => Some(*owner),
+        _ => None,
     }
 }
 
@@ -258,8 +290,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn season_admission_binds_the_wallet_and_canonical_option_payload() {
+        let checks = SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), l2: None };
+        let policy = [123u64.into(), Felt::ZERO, Felt::ZERO, Felt::ZERO, 1300u64.into()];
+        for suffix in [vec![Felt::ONE], vec![Felt::ZERO, 87u64.into()]] {
+            let mut fields = vec![14u64.into(), 99u64.into(), 123u64.into()];
+            fields.extend(suffix);
+            let valid = action(fields.clone());
+            assert!(checks.is_settlement(&valid));
+            assert!(checks.verify(&valid, &policy).await.unwrap());
+            let retained = Intent::decode(&valid.encode().unwrap()).unwrap();
+            assert_eq!(season_owner(&retained), Some(policy[0]));
+            fields[2] = 456u64.into();
+            assert!(!checks.verify(&action(fields.clone()), &policy).await.unwrap());
+            fields[2] = 123u64.into();
+            fields.push(Felt::ZERO);
+            assert!(!checks.verify(&action(fields), &policy).await.unwrap());
+            let mut changed = valid;
+            changed.arguments[1] = Felt::ONE;
+            assert!(!checks.verify(&changed, &policy).await.unwrap());
+        }
+        for suffix in [vec![], vec![Felt::ZERO], vec![Felt::TWO], vec![Felt::ZERO, Felt::from(u64::from(u32::MAX) + 1)]]
+        {
+            let mut fields = vec![14u64.into(), 99u64.into(), 123u64.into()];
+            fields.extend(suffix);
+            assert!(!checks.verify(&action(fields), &policy).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_cosmetics_preserve_ignored_tokens_but_require_the_bound_owner() {
-        let checks = SettlementChecks { tag: 11u64.into(), l2: None };
+        let checks = SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), l2: None };
         let action = action(vec![
             11u64.into(),
             99u64.into(),
@@ -340,6 +401,7 @@ mod tests {
         });
         let checks = SettlementChecks {
             tag: 11u64.into(),
+            season_tag: 14u64.into(),
             l2: Some(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>().unwrap()))),
         };
         let proposal = action(vec![
@@ -399,6 +461,7 @@ mod tests {
         });
         let checks = SettlementChecks {
             tag: 11u64.into(),
+            season_tag: 14u64.into(),
             l2: Some(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>().unwrap()))),
         };
         let proposal = action(vec![
