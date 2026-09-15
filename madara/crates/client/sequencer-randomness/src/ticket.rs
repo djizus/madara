@@ -1,8 +1,6 @@
 use crate::protocol::{Envelope, Intent, ProtocolError};
 use starknet_types_core::felt::Felt;
 
-pub const MAX_CONTEXT_SKEW_SECONDS: u64 = 300;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Proposed,
@@ -58,7 +56,7 @@ impl Context {
 }
 
 pub fn timestamp_in_bounds(recorded: u64, block_time: u64) -> bool {
-    block_time.checked_sub(recorded).is_some_and(|age| age <= MAX_CONTEXT_SKEW_SECONDS)
+    recorded <= block_time
 }
 
 /// The journal must persist exclusive sampling ownership before invoking `sample_os`.

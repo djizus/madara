@@ -5,7 +5,9 @@ The crate implements version 1 codecs, checked full-width OS sampling and the ac
 The working set alone is not durable. Before sampling, the journal must persist exclusive ownership of the proposal;
 only its replicated commit acknowledgement may call `committed`. A lost sampling attempt cannot be recreated.
 
-The maximum recorded-context age is 300 seconds, with no future timestamp allowed. Signed expiry applies at acceptance.
+Accepted contexts have no maximum age; a future timestamp is rejected. Signed expiry applies at acceptance.
+Execution lag above 300 seconds emits an operational warning and never cancels the ticket. The leader also checks
+the current admission time against signed expiry, so an old closed block cannot admit an expired intent.
 The same boundary vectors run in Rust and Cairo from `tests/fixtures/context-v1.txt`. Credentials, request identifiers
 and transaction hashes never enter action identity. Pending actions retain their accepted authorization evidence.
 

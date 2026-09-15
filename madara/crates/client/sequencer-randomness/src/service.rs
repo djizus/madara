@@ -19,11 +19,12 @@ use starknet_providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, Provid
 use starknet_signers::{LocalWallet, SigningKey};
 use std::{
     net::SocketAddr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
 
 type Sequencer = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
+const EXECUTION_LAG_ALERT_SECONDS: u64 = 300;
 const L2_GAS: u64 = 1_200_000_000;
 const HEAD: BlockId = BlockId::Tag(BlockTag::PreConfirmed);
 
@@ -186,12 +187,12 @@ impl Service {
             return Ok(None);
         }
         // Pending RPC calls and headers can synthesize wall time ahead of the batcher.
-        // Use the last closed timestamp within the declared skew, before sampling.
+        // Bind to the last closed timestamp before sampling; expiry still uses the current admission view.
         let timestamp = match self.account.provider().get_block_with_tx_hashes(BlockId::Tag(BlockTag::Latest)).await? {
             MaybePreConfirmedBlockWithTxHashes::Block(block) => block.timestamp,
             MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(_) => bail!("expected a confirmed timestamp"),
         };
-        if !timestamp_in_bounds(timestamp, (*observed_time).try_into()?) {
+        if !admission_time_is_valid(&intent, timestamp, (*observed_time).try_into()?) {
             return Ok(None);
         }
         let context = TicketContext {
@@ -257,6 +258,7 @@ impl Service {
         if let Some((progress, rejected)) = self.result(record.envelope.order).await? {
             return self.complete(&record, progress, rejected).await;
         }
+        report_execution_lag(&record, SystemTime::now());
         let transaction = self.submit(&record).await?;
         tokio::time::timeout(Duration::from_secs(300), async {
             loop {
@@ -361,6 +363,27 @@ impl Service {
     }
 }
 
+fn admission_time_is_valid(intent: &Intent, recorded: u64, observed: u64) -> bool {
+    timestamp_in_bounds(recorded, observed) && recorded >= intent.valid_from && observed <= intent.valid_until
+}
+
+// Host time is telemetry only. Neither a long outage nor a broken host clock cancels accepted work.
+fn report_execution_lag(record: &Record, now: SystemTime) {
+    let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
+        tracing::warn!(target: "sequencer_randomness", order = record.envelope.order,
+            "execution lag unavailable: host clock precedes Unix epoch");
+        return;
+    };
+    let execution_lag_seconds = elapsed.as_secs().saturating_sub(record.envelope.timestamp);
+    tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+        order = record.envelope.order, execution_lag_seconds, "randomness_execution_lag");
+    if execution_lag_seconds > EXECUTION_LAG_ALERT_SECONDS {
+        tracing::warn!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
+            order = record.envelope.order, execution_lag_seconds, threshold_seconds = EXECUTION_LAG_ALERT_SECONDS,
+            "accepted ticket execution delayed; retaining recorded context");
+    }
+}
+
 fn require_unreverted(status: &TransactionStatus) -> anyhow::Result<()> {
     if matches!(
         status,
@@ -376,6 +399,28 @@ fn require_unreverted(status: &TransactionStatus) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_intent_cannot_use_an_older_closed_block_to_enter() {
+        let intent = Intent {
+            chain: Felt::ONE,
+            deployment: Felt::ONE,
+            game: Felt::ONE,
+            actor: Felt::ONE,
+            nonce: 0,
+            command: Felt::ONE,
+            rules: Felt::ONE,
+            valid_from: 1000,
+            valid_until: 1010,
+            last_order: 10,
+            arguments: vec![],
+        };
+        assert!(admission_time_is_valid(&intent, 1005, 1010));
+        assert!(!admission_time_is_valid(&intent, 1005, 1011));
+        assert!(!admission_time_is_valid(&intent, 999, 1005));
+        assert!(!admission_time_is_valid(&intent, 1006, 1005));
+        assert!(timestamp_in_bounds(1005, 1005 + 86400));
+    }
 
     #[test]
     fn reverted_transport_stops_at_every_finality_without_resubmitting() {
