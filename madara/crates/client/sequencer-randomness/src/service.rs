@@ -1,6 +1,7 @@
 use crate::{
     journal::{Authorization, ChainProgress, Journal, Record},
     protocol::Intent,
+    settlement::SettlementChecks,
     submission::execution_calldata,
     ticket::{timestamp_in_bounds, Context as TicketContext, State as TicketState},
 };
@@ -76,6 +77,12 @@ struct Service {
     config: Configuration,
     account: Sequencer,
     journal: Journal,
+    settlement: SettlementChecks,
+}
+
+pub fn validate_native_schema(path: &std::path::Path) -> anyhow::Result<()> {
+    SettlementChecks::load(&std::fs::read_to_string(path)?, None)?;
+    Ok(())
 }
 
 /// Both placements use this worker. Disconnecting HTTP clients cannot cancel accepted work.
@@ -96,7 +103,10 @@ pub async fn run() -> anyhow::Result<()> {
         LocalWallet::from(SigningKey::from_secret_scalar(Felt::from_hex(&required("RANDOMNESS_PRIVATE_KEY")?)?));
     let account = SingleOwnerAccount::new(provider, signer, config.account, chain, ExecutionEncoding::New);
     let journal = Journal::connect(&config.primary, &config.standby, config.epoch).await?;
-    let mut service = Service { config, account, journal };
+    let schema = std::fs::read_to_string(required("RANDOMNESS_NATIVE_SCHEMA")?)?;
+    let l2 = std::env::var("RANDOMNESS_L2_RPC_URL").ok().filter(|url| !url.is_empty());
+    let settlement = SettlementChecks::load(&schema, l2.as_deref())?;
+    let mut service = Service { config, account, journal, settlement };
     service.recover().await?;
     let address: SocketAddr = required("RANDOMNESS_HTTP_BIND")?.parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -131,9 +141,12 @@ impl Service {
                     continue;
                 }
             };
-            let Some(record) = self.accept(intent, request.action.r, request.action.s).await? else {
-                let _ = request.response.send(Err(StatusCode::BAD_REQUEST));
-                continue;
+            let record = match self.accept(intent, request.action.r, request.action.s).await? {
+                Ok(record) => record,
+                Err(status) => {
+                    let _ = request.response.send(Err(status));
+                    continue;
+                }
             };
             tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
                 order = record.envelope.order, queue_ms, admission_ms = request.received.elapsed().as_secs_f64() * 1000.0,
@@ -160,31 +173,37 @@ impl Service {
             .await?)
     }
 
-    async fn accept(&mut self, intent: Intent, r: Felt, s: Felt) -> anyhow::Result<Option<Record>> {
-        let started = Instant::now();
-        if let Some(record) = self.journal.find_record(intent.identity()?).await? {
-            return Ok(Some(record));
-        }
-        if intent.chain != self.account.chain_id() || intent.deployment != self.config.deployment {
-            return Ok(None);
-        }
-        let fields = match self.view("get_admission", vec![intent.game, intent.actor]).await {
-            Ok(fields) => fields,
+    async fn admission_view(&self, name: &str, calldata: Vec<Felt>) -> anyhow::Result<Option<Vec<Felt>>> {
+        match self.view(name, calldata).await {
+            Ok(fields) => Ok(Some(fields)),
             Err(error)
                 if matches!(
                     error.downcast_ref::<ProviderError>(),
                     Some(ProviderError::StarknetError(StarknetError::ContractError(_)))
                 ) =>
             {
-                return Ok(None)
+                Ok(None)
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn accept(&mut self, intent: Intent, r: Felt, s: Felt) -> anyhow::Result<Result<Record, StatusCode>> {
+        let started = Instant::now();
+        if let Some(record) = self.journal.find_record(intent.identity()?).await? {
+            return Ok(Ok(record));
+        }
+        if intent.chain != self.account.chain_id() || intent.deployment != self.config.deployment {
+            return Ok(Err(StatusCode::BAD_REQUEST));
+        }
+        let Some(fields) = self.admission_view("get_admission", vec![intent.game, intent.actor]).await? else {
+            return Ok(Err(StatusCode::BAD_REQUEST));
         };
         let [key, rules, config, nonce, order, predecessor, state, observed_time] = fields.as_slice() else {
             bail!("malformed native admission context");
         };
         if !admission_state_matches(&intent, *rules, *nonce) {
-            return Ok(None);
+            return Ok(Err(StatusCode::BAD_REQUEST));
         }
         // Pending RPC calls and headers can synthesize wall time ahead of the batcher.
         // Bind to the last closed timestamp before sampling; expiry still uses the current admission view.
@@ -193,7 +212,7 @@ impl Service {
             MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(_) => bail!("expected a confirmed timestamp"),
         };
         if !admission_time_is_valid(&intent, timestamp, (*observed_time).try_into()?) {
-            return Ok(None);
+            return Ok(Err(StatusCode::BAD_REQUEST));
         }
         let context = TicketContext {
             order: (*order).try_into()?,
@@ -206,13 +225,45 @@ impl Service {
         if context.validate(&intent).is_err()
             || !matches!(starknet_crypto::verify(key, &intent.identity()?, &r, &s), Ok(true))
         {
-            return Ok(None);
+            return Ok(Err(StatusCode::BAD_REQUEST));
+        }
+        if self.settlement.is_settlement(&intent) {
+            if let Some(status) = self.settlement_refusal(&intent, timestamp, &fields).await? {
+                return Ok(Err(status));
+            }
         }
         let checks_ms = started.elapsed().as_secs_f64() * 1000.0;
         let record = self.journal.accept(intent, context, Authorization { public_key: *key, r, s }).await?;
         tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
             order = record.envelope.order, checks_ms, "randomness_admission_checks");
-        Ok(Some(record))
+        Ok(Ok(record))
+    }
+
+    async fn settlement_refusal(
+        &self,
+        intent: &Intent,
+        timestamp: u64,
+        admission: &[Felt],
+    ) -> anyhow::Result<Option<StatusCode>> {
+        let Some(policy) = self.admission_view("settlement_admission", vec![intent.game, intent.actor]).await? else {
+            return Ok(Some(StatusCode::BAD_REQUEST));
+        };
+        match self.settlement.verify(intent, &policy).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some(StatusCode::BAD_REQUEST)),
+            Err(error) => {
+                tracing::warn!(target: "sequencer_randomness", action = %intent.identity()?.to_hex_string(),
+                    error = %error, "cosmetic admission unavailable before ticket acceptance");
+                return Ok(Some(StatusCode::SERVICE_UNAVAILABLE));
+            }
+        }
+        let Some(current) = self.admission_view("get_admission", vec![intent.game, intent.actor]).await? else {
+            return Ok(Some(StatusCode::BAD_REQUEST));
+        };
+        if !admission_survived_external_checks(intent, timestamp, admission, &current)? {
+            return Ok(Some(StatusCode::BAD_REQUEST));
+        }
+        Ok(None)
     }
 
     async fn result(&self, order: u64) -> anyhow::Result<Option<(ChainProgress, bool)>> {
@@ -371,6 +422,19 @@ fn admission_time_is_valid(intent: &Intent, recorded: u64, observed: u64) -> boo
     timestamp_in_bounds(recorded, observed) && recorded >= intent.valid_from && observed <= intent.valid_until
 }
 
+// External token reads may outlast the proposal's window or overlap a registry change.
+fn admission_survived_external_checks(
+    intent: &Intent,
+    recorded: u64,
+    before: &[Felt],
+    after: &[Felt],
+) -> anyhow::Result<bool> {
+    if before.len() != 8 || after.len() != 8 {
+        bail!("malformed native admission context");
+    }
+    Ok(before[..7] == after[..7] && admission_time_is_valid(intent, recorded, after[7].try_into()?))
+}
+
 // Host time is telemetry only. Neither a long outage nor a broken host clock cancels accepted work.
 fn report_execution_lag(record: &Record, now: SystemTime) {
     let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
@@ -424,6 +488,18 @@ mod tests {
         assert!(!admission_time_is_valid(&intent, 999, 1005));
         assert!(!admission_time_is_valid(&intent, 1006, 1005));
         assert!(timestamp_in_bounds(1005, 1005 + 86400));
+        let before = [Felt::ONE, Felt::ONE, Felt::ONE, Felt::ZERO, Felt::ONE, Felt::ZERO, Felt::ONE, 1005u64.into()];
+        let mut after = before;
+        after[7] = 1010u64.into();
+        assert!(admission_survived_external_checks(&intent, 1005, &before, &after).unwrap());
+        after[7] = 1011u64.into();
+        assert!(!admission_survived_external_checks(&intent, 1005, &before, &after).unwrap());
+        for index in 0..7 {
+            let mut changed = before;
+            changed[index] += Felt::ONE;
+            assert!(!admission_survived_external_checks(&intent, 1005, &before, &changed).unwrap());
+        }
+        assert!(admission_survived_external_checks(&intent, 1005, &before, &before[..7]).is_err());
     }
 
     #[test]
