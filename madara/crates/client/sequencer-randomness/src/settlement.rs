@@ -12,6 +12,7 @@ use starknet_types_core::hash::{Poseidon, StarkHash};
 pub(crate) struct SettlementChecks {
     tag: Felt,
     season_tag: Felt,
+    village_tag: Felt,
     l2: Option<JsonRpcClient<HttpTransport>>,
 }
 
@@ -59,14 +60,35 @@ impl SettlementChecks {
                 ("selected_realm", "core::option::Option::<core::integer::u32>"),
             ],
         )?;
+        let village_tag = commands
+            .iter()
+            .position(|variant| variant["name"] == "SettleVillage")
+            .context("missing village settlement command")?;
+        require_members(
+            types,
+            commands[village_tag]["type"].as_str().context("missing village payload")?,
+            &[
+                ("owner", "core::starknet::contract_address::ContractAddress"),
+                ("pass_id", "core::integer::u16"),
+                ("connected_realm_entity_id", "core::integer::u32"),
+            ],
+        )?;
         let l2 = l2
             .map(|url| Ok::<_, anyhow::Error>(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>()?))))
             .transpose()?;
-        Ok(Self { tag: Felt::from(tag as u64), season_tag: Felt::from(season_tag as u64), l2 })
+        Ok(Self {
+            tag: Felt::from(tag as u64),
+            season_tag: Felt::from(season_tag as u64),
+            village_tag: Felt::from(village_tag as u64),
+            l2,
+        })
     }
 
     pub(crate) fn is_settlement(&self, intent: &Intent) -> bool {
-        intent.arguments.first().is_some_and(|tag| *tag == self.tag || *tag == self.season_tag)
+        intent
+            .arguments
+            .first()
+            .is_some_and(|tag| *tag == self.tag || *tag == self.season_tag || *tag == self.village_tag)
     }
 
     /// Called only for a new proposal. Recovery reads the retained arguments without external calls.
@@ -82,6 +104,9 @@ impl SettlementChecks {
         };
         if intent.arguments.first() == Some(&self.season_tag) {
             return Ok(season_owner(intent).is_some_and(|claimed| claimed == *owner && *owner != Felt::ZERO));
+        }
+        if intent.arguments.first() == Some(&self.village_tag) {
+            return Ok(village_owner(intent).is_some_and(|claimed| claimed == *owner && *owner != Felt::ZERO));
         }
         let Some(claims) = Claims::decode(intent) else {
             return Ok(false);
@@ -193,6 +218,16 @@ fn season_owner(intent: &Intent) -> Option<Felt> {
     }
 }
 
+fn village_owner(intent: &Intent) -> Option<Felt> {
+    if !command_matches(intent) {
+        return None;
+    }
+    match intent.arguments.as_slice() {
+        [_, owner, pass, realm] if u16::try_from(*pass).is_ok() && u32::try_from(*realm).is_ok() => Some(*owner),
+        _ => None,
+    }
+}
+
 async fn read_token(
     l2: &JsonRpcClient<HttpTransport>,
     collection: Felt,
@@ -237,6 +272,37 @@ mod tests {
             last_order: 1,
             arguments,
         }
+    }
+
+    #[tokio::test]
+    async fn village_admission_binds_the_pass_owner_and_rejects_malformed_claims() {
+        let checks =
+            SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
+        let policy = [123u64.into(), Felt::ZERO, Felt::ZERO, Felt::ZERO, 1300u64.into()];
+        let fields = vec![15u64.into(), policy[0], u16::MAX.into(), u32::MAX.into()];
+        let valid = action(fields.clone());
+        assert!(checks.is_settlement(&valid));
+        assert!(checks.verify(&valid, &policy).await.unwrap());
+        let retained = Intent::decode(&valid.encode().unwrap()).unwrap();
+        assert_eq!(village_owner(&retained), Some(policy[0]));
+        for (index, replacement) in [
+            (1, Felt::from(456u64)),
+            (2, Felt::from(u64::from(u16::MAX) + 1)),
+            (3, Felt::from(u64::from(u32::MAX) + 1)),
+        ] {
+            let mut invalid = fields.clone();
+            invalid[index] = replacement;
+            assert!(!checks.verify(&action(invalid), &policy).await.unwrap());
+        }
+        for length in 0..fields.len() {
+            assert!(!checks.verify(&action(fields[..length].to_vec()), &policy).await.unwrap());
+        }
+        let mut extended = fields;
+        extended.push(Felt::ZERO);
+        assert!(!checks.verify(&action(extended), &policy).await.unwrap());
+        let mut tampered = valid;
+        tampered.arguments[2] = Felt::ZERO;
+        assert!(!checks.verify(&tampered, &policy).await.unwrap());
     }
 
     fn finalized_block() -> Value {
@@ -291,7 +357,8 @@ mod tests {
 
     #[tokio::test]
     async fn season_admission_binds_the_wallet_and_canonical_option_payload() {
-        let checks = SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), l2: None };
+        let checks =
+            SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
         let policy = [123u64.into(), Felt::ZERO, Felt::ZERO, Felt::ZERO, 1300u64.into()];
         for suffix in [vec![Felt::ONE], vec![Felt::ZERO, 87u64.into()]] {
             let mut fields = vec![14u64.into(), 99u64.into(), 123u64.into()];
@@ -320,7 +387,8 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_cosmetics_preserve_ignored_tokens_but_require_the_bound_owner() {
-        let checks = SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), l2: None };
+        let checks =
+            SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
         let action = action(vec![
             11u64.into(),
             99u64.into(),
@@ -402,6 +470,7 @@ mod tests {
         let checks = SettlementChecks {
             tag: 11u64.into(),
             season_tag: 14u64.into(),
+            village_tag: 15u64.into(),
             l2: Some(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>().unwrap()))),
         };
         let proposal = action(vec![
@@ -462,6 +531,7 @@ mod tests {
         let checks = SettlementChecks {
             tag: 11u64.into(),
             season_tag: 14u64.into(),
+            village_tag: 15u64.into(),
             l2: Some(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>().unwrap()))),
         };
         let proposal = action(vec![
