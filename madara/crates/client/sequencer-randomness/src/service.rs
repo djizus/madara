@@ -6,7 +6,14 @@ use crate::{
     ticket::{timestamp_in_bounds, Context as TicketContext, State as TicketState},
 };
 use anyhow::{bail, Context};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::{Path, Request, State},
+    http::{header, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use starknet_accounts::{Account, ConnectedAccount, ExecutionEncoding, SingleOwnerAccount};
 use starknet_core::{
@@ -20,6 +27,7 @@ use starknet_providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, Provid
 use starknet_signers::{LocalWallet, SigningKey};
 use std::{
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -67,6 +75,20 @@ struct Accepted {
     order: u64,
 }
 
+/// Public recovery status contains no entropy or authorization witness.
+#[derive(Serialize)]
+struct ActionStatus {
+    action: Felt,
+    order: u64,
+    transaction_hash: Option<Felt>,
+}
+
+struct HttpState {
+    admissions: mpsc::Sender<AdmissionRequest>,
+    journal: Journal,
+    provider: JsonRpcClient<HttpTransport>,
+}
+
 struct AdmissionRequest {
     action: ActionRequest,
     response: oneshot::Sender<Result<Accepted, StatusCode>>,
@@ -111,22 +133,74 @@ pub async fn run() -> anyhow::Result<()> {
     let address: SocketAddr = required("RANDOMNESS_HTTP_BIND")?.parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let (sender, receiver) = mpsc::channel(64);
-    let router = Router::new().route("/actions", post(admit)).with_state(sender);
+    let state = Arc::new(HttpState {
+        admissions: sender,
+        journal: Journal::connect(&service.config.primary, &service.config.standby, service.config.epoch).await?,
+        provider: JsonRpcClient::new(HttpTransport::new(required("RANDOMNESS_RPC_URL")?.parse::<url::Url>()?)),
+    });
+    let router = Router::new()
+        .route("/actions", post(admit))
+        .route("/actions/:action", get(action_status))
+        .with_state(state)
+        .layer(middleware::from_fn(browser_access));
     tokio::select! {
         result = axum::serve(listener, router) => result.context("admission server"),
         result = service.work(receiver) => result,
     }
 }
 
+// Public signed intents use no ambient cookies or credentials. Entropy and witnesses are never HTTP responses.
+async fn browser_access(request: Request, next: Next) -> Response {
+    let mut response = if request.method() == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().expect("static header"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS".parse().expect("static header"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type".parse().expect("static header"));
+    response
+}
+
 async fn admit(
-    State(sender): State<mpsc::Sender<AdmissionRequest>>,
+    State(state): State<Arc<HttpState>>,
     Json(action): Json<ActionRequest>,
 ) -> Result<Json<Accepted>, StatusCode> {
     let (response, receiver) = oneshot::channel();
-    sender
+    state
+        .admissions
         .try_send(AdmissionRequest { action, response, received: Instant::now() })
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     receiver.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.map(Json)
+}
+
+async fn action_status(
+    State(state): State<Arc<HttpState>>,
+    Path(action): Path<String>,
+) -> Result<Json<ActionStatus>, StatusCode> {
+    let action = Felt::from_hex(&action).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let record = state.journal.find_record(action).await.map_err(status_unavailable)?.ok_or(StatusCode::NOT_FOUND)?;
+    let submissions = state.journal.submissions(action).await.map_err(status_unavailable)?;
+    // A retained transaction is not necessarily broadcast. During recovery several credentials
+    // may have signed the same ticket; only a hash known to the chain is useful to the client.
+    let mut transaction_hash = None;
+    for submission in submissions {
+        match state.provider.get_transaction_status(submission.transaction_hash).await {
+            Ok(_) => {
+                transaction_hash = Some(submission.transaction_hash);
+                break;
+            }
+            Err(ProviderError::StarknetError(StarknetError::TransactionHashNotFound)) => {}
+            Err(error) => return Err(status_unavailable(error)),
+        }
+    }
+    Ok(Json(ActionStatus { action, order: record.envelope.order, transaction_hash }))
+}
+
+fn status_unavailable(error: impl std::fmt::Display) -> StatusCode {
+    tracing::warn!(target: "sequencer_randomness", %error, "action_status_unavailable");
+    StatusCode::SERVICE_UNAVAILABLE
 }
 
 impl Service {
@@ -468,6 +542,31 @@ fn require_unreverted(status: &TransactionStatus) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn browser_preflight_and_rejections_keep_cors_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/actions", post(|| async { StatusCode::BAD_REQUEST }))
+            .layer(middleware::from_fn(browser_access));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        for (method, status) in [("OPTIONS", "204 No Content"), ("POST", "400 Bad Request")] {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request = format!("{method} /actions HTTP/1.1\r\nHost: {address}\r\nOrigin: https://play.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert!(response.contains("access-control-allow-origin: *"));
+            assert!(response.contains("access-control-allow-headers: content-type"));
+            assert!(!response.contains("access-control-allow-credentials"));
+        }
+        server.abort();
+    }
+
     #[test]
     fn expired_intent_cannot_use_an_older_closed_block_to_enter() {
         let intent = Intent {
@@ -543,6 +642,20 @@ mod tests {
         ] {
             assert!(require_unreverted(&status).is_ok());
         }
+    }
+
+    #[test]
+    fn action_status_exposes_only_ticket_and_transaction_identity() {
+        let pending = ActionStatus { action: Felt::ONE, order: 7, transaction_hash: None };
+        assert_eq!(
+            serde_json::to_value(pending).unwrap(),
+            serde_json::json!({"action": "0x1", "order": 7, "transaction_hash": null})
+        );
+        let submitted = ActionStatus { action: Felt::ONE, order: 7, transaction_hash: Some(Felt::TWO) };
+        assert_eq!(
+            serde_json::to_value(submitted).unwrap(),
+            serde_json::json!({"action": "0x1", "order": 7, "transaction_hash": "0x2"})
+        );
     }
 
     #[test]
