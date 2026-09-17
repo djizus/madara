@@ -89,6 +89,7 @@ fn authentication_revert(reason: &str) -> bool {
         "recorded resource bounds mismatch",
         "execution config mismatch",
         "future execution time",
+        "backwards execution time",
         "malformed envelope",
         "invalid player signature",
         "invalid acceptance",
@@ -122,6 +123,51 @@ pub(crate) fn limit_reason(reason: &str) -> Option<&'static str> {
     ["Exceeded the maximum number of events,", "Exceeded the maximum data length,", "Exceeded the maximum keys length,"]
         .into_iter()
         .find(|message| reason.contains(message))
+}
+
+/// Outcomes are authenticated by the retained transaction and the season emitter, then
+/// folded into the same binding-dependent state commitment as the contract.
+pub(crate) fn receipt_outcome(
+    record: &Record,
+    receipt: &starknet_core::types::TransactionReceipt,
+) -> anyhow::Result<Option<(ChainProgress, bool)>> {
+    use starknet_core::{types::Felt, utils::get_selector_from_name};
+    use starknet_types_core::hash::{Poseidon, StarkHash};
+    if matches!(receipt.execution_result(), ExecutionResult::Reverted { .. }) {
+        return Ok(None);
+    }
+    let prefix = [get_selector_from_name("RecordingEvent")?, get_selector_from_name("ExecutionRecorded")?];
+    let mut events =
+        receipt.events().iter().filter(|event| event.from_address == record.intent.deployment && event.keys == prefix);
+    let Some(event) = events.next() else {
+        anyhow::bail!("successful recorded transaction has no execution event");
+    };
+    if events.next().is_some() {
+        anyhow::bail!("duplicate execution event");
+    }
+    let [game, actor, nonce, consumed, order, status, reason] = event.data.as_slice() else {
+        anyhow::bail!("malformed execution event");
+    };
+    if *game != record.intent.game
+        || *actor != record.intent.actor
+        || *nonce != Felt::from(record.intent.nonce)
+        || *order != Felt::from(record.envelope.order)
+        || (*consumed != Felt::ZERO && *consumed != Felt::ONE)
+        || !((*status == Felt::ONE && *reason == Felt::ZERO) || (*status == Felt::TWO && *reason != Felt::ZERO))
+    {
+        anyhow::bail!("execution event does not match accepted ticket");
+    }
+    let binding = record.envelope.binding()?;
+    let state = Poseidon::hash_array(&[record.envelope.preceding_state, binding, *status, *reason, *consumed]);
+    Ok(Some((
+        ChainProgress {
+            order: record.envelope.order,
+            binding,
+            state,
+            result: if *status == Felt::TWO { *reason } else { state },
+        },
+        *status == Felt::TWO,
+    )))
 }
 
 #[cfg(test)]
@@ -169,7 +215,6 @@ mod tests {
             envelope: Envelope {
                 action: intent.identity().unwrap(),
                 order,
-                predecessor: Felt::ZERO,
                 preceding_state: Felt::ZERO,
                 timestamp: 1005,
                 execution_config: Felt::ONE,
@@ -258,6 +303,66 @@ mod tests {
             assert!(envelope == &record(*order).envelope);
         }
         chain
+    }
+
+    fn receipt(record: &Record, status: u64, reason: Felt, consumed: bool) -> starknet_core::types::TransactionReceipt {
+        use starknet_core::utils::get_selector_from_name;
+        serde_json::from_value(serde_json::json!({
+            "type": "INVOKE", "transaction_hash": "0x1", "actual_fee": {"amount":"0x0", "unit":"FRI"},
+            "finality_status":"ACCEPTED_ON_L2", "execution_status":"SUCCEEDED", "messages_sent":[],
+            "execution_resources":{"l1_gas":0,"l1_data_gas":0,"l2_gas":0},
+            "events":[{"from_address":record.intent.deployment,
+                "keys":[get_selector_from_name("RecordingEvent").unwrap(),get_selector_from_name("ExecutionRecorded").unwrap()],
+                "data":[record.intent.game,record.intent.actor,Felt::from(record.intent.nonce),
+                    Felt::from(u64::from(consumed)),Felt::from(record.envelope.order),Felt::from(status),reason]}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn receipt_outcome_matches_ticket_and_binds_root_state_and_consumption() {
+        let record = record(1);
+        let event = receipt(&record, 1, Felt::ZERO, true);
+        let (success, rejected) = receipt_outcome(&record, &event).unwrap().unwrap();
+        assert!(!rejected);
+        assert_eq!(success.binding, record.envelope.binding().unwrap());
+        assert_eq!(success.result, success.state);
+        let failed = receipt(&record, 2, Felt::from_bytes_be_slice(b"STALE_NONCE"), false);
+        let (failure, rejected) = receipt_outcome(&record, &failed).unwrap().unwrap();
+        assert!(rejected);
+        assert_eq!(failure.result, Felt::from_bytes_be_slice(b"STALE_NONCE"));
+        assert_ne!(failure.state, success.state);
+        let consumed_failure = receipt(&record, 2, failure.result, true);
+        assert_ne!(receipt_outcome(&record, &consumed_failure).unwrap().unwrap().0.state, failure.state);
+        let mut changed_root = self::record(1);
+        changed_root.envelope.root[0] ^= 1;
+        assert_ne!(receipt_outcome(&changed_root, &event).unwrap().unwrap().0.state, success.state);
+        let mut changed_state = self::record(1);
+        changed_state.envelope.preceding_state += Felt::ONE;
+        assert_ne!(receipt_outcome(&changed_state, &event).unwrap().unwrap().0.state, success.state);
+    }
+
+    #[test]
+    fn malformed_foreign_duplicate_and_mismatched_execution_events_are_rejected() {
+        let record = record(1);
+        for case in 0..8 {
+            let mut event = receipt(&record, 1, Felt::ZERO, true);
+            let starknet_core::types::TransactionReceipt::Invoke(ref mut invoke) = event else { unreachable!() };
+            match case {
+                0 => invoke.events[0].from_address += Felt::ONE,
+                1 => invoke.events.push(invoke.events[0].clone()),
+                2 => invoke.events[0].data[0] += Felt::ONE,
+                3 => invoke.events[0].data[1] += Felt::ONE,
+                4 => invoke.events[0].data[2] += Felt::ONE,
+                5 => invoke.events[0].data[3] = Felt::TWO,
+                6 => invoke.events[0].data[4] += Felt::ONE,
+                _ => {
+                    invoke.events[0].data.pop();
+                }
+            }
+            assert!(receipt_outcome(&record, &event).is_err());
+        }
+        assert!(receipt_outcome(&record, &receipt(&record, 1, Felt::ONE, true)).is_err());
+        assert!(receipt_outcome(&record, &receipt(&record, 2, Felt::ZERO, true)).is_err());
     }
 
     #[tokio::test]

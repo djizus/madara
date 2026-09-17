@@ -45,7 +45,6 @@ fn intent() -> Intent {
 fn context() -> Context {
     Context {
         order: 1,
-        predecessor: Felt::ZERO,
         preceding_state: Felt::ZERO,
         timestamp: 1005,
         execution_config: Felt::ONE,
@@ -96,6 +95,8 @@ async fn replicated_journal_rehearsal() {
     }
     let record = admitted.pop().unwrap();
     assert!(admitted.iter().all(|other| other.envelope == record.envelope));
+    assert!(journal.begin_key_rotation(Felt::from(99), b"signed rotation").await.is_err());
+    assert!(journal.pending_key_rotation().await.unwrap().is_none());
     let binding = record.envelope.binding().unwrap();
     let action = record.envelope.action;
     let mut later = context();
@@ -200,8 +201,32 @@ async fn replicated_journal_rehearsal() {
     assert!(restarted.recover(&[]).await.is_err());
     eprintln!("PASS chain-ahead reconciliation, terminal rejection, consumed nonce, conflicting result");
 
+    let rotation_hash = Felt::from(99);
+    restarted.begin_key_rotation(rotation_hash, b"signed rotation").await.unwrap();
+    assert!(stale.begin_key_rotation(rotation_hash, b"signed rotation").await.is_err());
+    let after_restart =
+        Journal::connect(&PRIMARY.replace("writer_1", "writer_2"), &STANDBY.replace("writer_1", "writer_2"), 2)
+            .await
+            .unwrap();
+    assert_eq!(after_restart.pending_key_rotation().await.unwrap(), Some((rotation_hash, b"signed rotation".to_vec())));
+    let mut next = intent();
+    next.nonce = 1;
+    let private_key = Felt::from(12345);
+    let identity = next.identity().unwrap();
+    let k = starknet_crypto::rfc6979_generate_k(&identity, &private_key, None);
+    let signature = starknet_crypto::sign(&private_key, &identity, &k).unwrap();
+    let auth = Authorization { public_key: authorization().public_key, r: signature.r, s: signature.s };
+    let next_context = Context { order: 2, preceding_state: Felt::THREE, ..context() };
+    assert!(restarted.accept(next, next_context, auth).await.is_err());
+    assert!(after_restart.finish_key_rotation(Felt::ONE).await.is_err());
+    after_restart.finish_key_rotation(rotation_hash).await.unwrap();
+    assert!(restarted.pending_key_rotation().await.unwrap().is_none());
+    eprintln!(
+        "PASS rotation waits for pending actions; durable admission fence survives restart until the matching outcome"
+    );
+
     admin
-        .execute("UPDATE randomness.tickets SET envelope = set_byte(envelope,351,get_byte(envelope,351)#1)", &[])
+        .execute("UPDATE randomness.tickets SET envelope = set_byte(envelope,319,get_byte(envelope,319)#1)", &[])
         .await
         .unwrap();
     assert!(restarted.recover(&chain).await.is_err());
@@ -220,7 +245,6 @@ async fn replicated_journal_rehearsal() {
     let reserved = Envelope {
         action,
         order: 1,
-        predecessor: Felt::ZERO,
         preceding_state: Felt::ZERO,
         timestamp: 1005,
         execution_config: Felt::ONE,
@@ -236,7 +260,7 @@ async fn replicated_journal_rehearsal() {
                 &action.to_bytes_be().to_vec(),
                 &1_i64,
                 &encode_bytes(&unsigned.encode().unwrap()),
-                &encode_bytes(&reserved.encode().unwrap()[..9]),
+                &encode_bytes(&reserved.encode().unwrap()[..8]),
                 &encode_bytes(&[Felt::ONE, Felt::TWO, Felt::THREE]),
             ],
         )
@@ -263,7 +287,7 @@ async fn replicated_journal_rehearsal() {
                     &action.to_bytes_be().to_vec(),
                     &1_i64,
                     &encode_bytes(&unsigned.encode().unwrap()),
-                    &encode_bytes(&reserved.encode().unwrap()[..9]),
+                    &encode_bytes(&reserved.encode().unwrap()[..8]),
                     &encode_bytes(&[Felt::ONE, Felt::TWO, Felt::THREE]),
                 ],
             )

@@ -22,7 +22,7 @@ impl Fixture {
 #[test]
 fn canonical_cross_language_vectors() {
     let mut fixture = Fixture {
-        fields: include_str!("fixtures/v1.txt")
+        fields: include_str!("fixtures/v2.txt")
             .split_whitespace()
             .map(|field| Felt::from_hex(field).unwrap())
             .collect::<Vec<_>>()
@@ -103,7 +103,6 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
     let envelope = Envelope {
         action: sample_intent().identity().unwrap(),
         order: 1,
-        predecessor: Felt::ZERO,
         preceding_state: Felt::ONE,
         timestamp: 2,
         execution_config: Felt::ONE,
@@ -117,12 +116,12 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
     let mut trailing = fields.clone();
     trailing.push(Felt::ZERO);
     assert!(Envelope::decode(&trailing).is_err());
-    for index in [0, 1, 3, 6, 8, 9, 10] {
+    for index in [0, 1, 3, 5, 7, 8, 9] {
         let mut malformed = fields.clone();
         malformed[index] = Felt::MAX;
         assert!(Envelope::decode(&malformed).is_err());
     }
-    for index in [3, 8] {
+    for index in [3, 7] {
         let mut zero = fields.clone();
         zero[index] = Felt::ZERO;
         assert!(Envelope::decode(&zero).is_err());

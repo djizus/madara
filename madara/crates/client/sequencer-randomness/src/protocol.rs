@@ -93,7 +93,6 @@ impl Intent {
 pub struct Envelope {
     pub action: Felt,
     pub order: u64,
-    pub predecessor: Felt,
     pub preceding_state: Felt,
     pub timestamp: u64,
     pub execution_config: Felt,
@@ -109,10 +108,9 @@ impl Envelope {
         let (low, high) = root_limbs(self.root);
         Ok(vec![
             ENVELOPE_TAG,
-            VERSION,
+            Felt::TWO,
             self.action,
             self.order.into(),
-            self.predecessor,
             self.preceding_state,
             self.timestamp.into(),
             self.execution_config,
@@ -123,22 +121,21 @@ impl Envelope {
     }
 
     pub fn decode(fields: &[Felt]) -> Result<Self, ProtocolError> {
-        if fields.len() != 11 || fields[0] != ENVELOPE_TAG || fields[1] != VERSION {
+        if fields.len() != 10 || fields[0] != ENVELOPE_TAG || fields[1] != Felt::TWO {
             return Err(ProtocolError::Envelope);
         }
-        let low: u128 = fields[9].try_into().map_err(|_| ProtocolError::Envelope)?;
-        let high: u128 = fields[10].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let low: u128 = fields[8].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let high: u128 = fields[9].try_into().map_err(|_| ProtocolError::Envelope)?;
         let mut root = [0; 32];
         root[..16].copy_from_slice(&high.to_be_bytes());
         root[16..].copy_from_slice(&low.to_be_bytes());
         let envelope = Self {
             action: fields[2],
             order: fields[3].try_into().map_err(|_| ProtocolError::Envelope)?,
-            predecessor: fields[4],
-            preceding_state: fields[5],
-            timestamp: fields[6].try_into().map_err(|_| ProtocolError::Envelope)?,
-            execution_config: fields[7],
-            l2_gas: fields[8].try_into().map_err(|_| ProtocolError::Envelope)?,
+            preceding_state: fields[4],
+            timestamp: fields[5].try_into().map_err(|_| ProtocolError::Envelope)?,
+            execution_config: fields[6],
+            l2_gas: fields[7].try_into().map_err(|_| ProtocolError::Envelope)?,
             root,
         };
         envelope.encode()?;

@@ -201,23 +201,23 @@ pub fn decode_execution(calldata: &[Felt], deployment: Felt) -> anyhow::Result<E
         bail!("too many action arguments");
     }
     let intent_length = 11 + argument_count;
-    if payload.len() != intent_length + 16 || payload[intent_length] != Felt::from(11) {
+    if payload.len() != intent_length + 15 || payload[intent_length] != Felt::from(10) {
         bail!("malformed recorded context");
     }
     let mut fields = vec![Felt::from_bytes_be_slice(b"ETERNUM_ACTION"), Felt::ONE];
     fields.extend_from_slice(&payload[..intent_length]);
     let intent = Intent::decode(&fields)?;
-    let envelope = Envelope::decode(&payload[intent_length + 1..intent_length + 12])?;
+    let envelope = Envelope::decode(&payload[intent_length + 1..intent_length + 11])?;
     if envelope.action != intent.identity()? {
         bail!("action binding mismatch");
     }
     Ok(Execution {
         intent,
         envelope,
-        epoch: payload[intent_length + 12].try_into().context("invalid authority epoch")?,
-        accepted_public_key: payload[intent_length + 13],
-        r: payload[intent_length + 14],
-        s: payload[intent_length + 15],
+        epoch: payload[intent_length + 11].try_into().context("invalid authority epoch")?,
+        accepted_public_key: payload[intent_length + 12],
+        r: payload[intent_length + 13],
+        s: payload[intent_length + 14],
     })
 }
 
@@ -242,7 +242,6 @@ mod tests {
         let envelope = Envelope {
             action: intent.identity().unwrap(),
             order: 1,
-            predecessor: Felt::ZERO,
             preceding_state: Felt::ZERO,
             timestamp: 1005,
             execution_config: Felt::ONE,

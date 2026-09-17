@@ -31,7 +31,6 @@ impl SettlementChecks {
             commands[tag]["type"].as_str().context("missing settlement payload type")?,
             &[
                 ("name", "core::felt252"),
-                ("owner", "core::starknet::contract_address::ContractAddress"),
                 ("cosmetics_block_hash", "core::felt252"),
                 ("cosmetics_block_number", "core::integer::u64"),
                 ("cosmetics", "core::array::Span::<world_native::settlement::AcceptedCosmetic>"),
@@ -54,11 +53,7 @@ impl SettlementChecks {
         require_members(
             types,
             commands[season_tag]["type"].as_str().context("missing season settlement payload")?,
-            &[
-                ("name", "core::felt252"),
-                ("owner", "core::starknet::contract_address::ContractAddress"),
-                ("selected_realm", "core::option::Option::<core::integer::u32>"),
-            ],
+            &[("name", "core::felt252"), ("selected_realm", "core::option::Option::<core::integer::u32>")],
         )?;
         let village_tag = commands
             .iter()
@@ -67,11 +62,7 @@ impl SettlementChecks {
         require_members(
             types,
             commands[village_tag]["type"].as_str().context("missing village payload")?,
-            &[
-                ("owner", "core::starknet::contract_address::ContractAddress"),
-                ("pass_id", "core::integer::u16"),
-                ("connected_realm_entity_id", "core::integer::u32"),
-            ],
+            &[("pass_id", "core::integer::u16"), ("connected_realm_entity_id", "core::integer::u32")],
         )?;
         let l2 = l2
             .map(|url| Ok::<_, anyhow::Error>(JsonRpcClient::new(HttpTransport::new(url.parse::<url::Url>()?))))
@@ -103,15 +94,15 @@ impl SettlementChecks {
             bail!("malformed settlement admission policy");
         };
         if intent.arguments.first() == Some(&self.season_tag) {
-            return Ok(season_owner(intent).is_some_and(|claimed| claimed == *owner && *owner != Felt::ZERO));
+            return Ok(valid_season_payload(intent) && *owner != Felt::ZERO);
         }
         if intent.arguments.first() == Some(&self.village_tag) {
-            return Ok(village_owner(intent).is_some_and(|claimed| claimed == *owner && *owner != Felt::ZERO));
+            return Ok(valid_village_payload(intent) && *owner != Felt::ZERO);
         }
         let Some(claims) = Claims::decode(intent) else {
             return Ok(false);
         };
-        if claims.owner != *owner || *owner == Felt::ZERO {
+        if *owner == Felt::ZERO {
             return Ok(false);
         }
         if *collection == Felt::ZERO || *timelock == Felt::ZERO {
@@ -172,7 +163,6 @@ struct Token {
     attributes: u128,
 }
 struct Claims {
-    owner: Felt,
     block_hash: Felt,
     block_number: u64,
     tokens: Vec<Token>,
@@ -183,20 +173,20 @@ impl Claims {
             return None;
         }
         let fields = &intent.arguments;
-        let count = usize::try_from(u32::try_from(*fields.get(5)?).ok()?).ok()?;
-        if fields.len() != 7usize.checked_add(count.checked_mul(3)?)? {
+        let count = usize::try_from(u32::try_from(*fields.get(4)?).ok()?).ok()?;
+        if fields.len() != 6usize.checked_add(count.checked_mul(3)?)? {
             return None;
         }
         if *fields.last()? != Felt::ZERO && *fields.last()? != Felt::ONE {
             return None;
         }
-        let tokens = fields[6..fields.len() - 1]
+        let tokens = fields[5..fields.len() - 1]
             .chunks_exact(3)
             .map(|token| {
                 Some(Token { id: token[0].try_into().ok()?, owner: token[1], attributes: token[2].try_into().ok()? })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { owner: fields[2], block_hash: fields[3], block_number: fields[4].try_into().ok()?, tokens })
+        Some(Self { block_hash: fields[2], block_number: fields[3].try_into().ok()?, tokens })
     }
 }
 
@@ -207,25 +197,21 @@ fn command_matches(intent: &Intent) -> bool {
     Poseidon::hash_array(&commitment) == intent.command
 }
 
-fn season_owner(intent: &Intent) -> Option<Felt> {
-    if !command_matches(intent) {
-        return None;
-    }
-    match intent.arguments.as_slice() {
-        [_, _, owner, option] if *option == Felt::ONE => Some(*owner),
-        [_, _, owner, option, realm] if *option == Felt::ZERO && u32::try_from(*realm).is_ok() => Some(*owner),
-        _ => None,
-    }
+fn valid_season_payload(intent: &Intent) -> bool {
+    command_matches(intent)
+        && match intent.arguments.as_slice() {
+            [_, _, option] if *option == Felt::ONE => true,
+            [_, _, option, realm] if *option == Felt::ZERO => u32::try_from(*realm).is_ok(),
+            _ => false,
+        }
 }
 
-fn village_owner(intent: &Intent) -> Option<Felt> {
-    if !command_matches(intent) {
-        return None;
-    }
-    match intent.arguments.as_slice() {
-        [_, owner, pass, realm] if u16::try_from(*pass).is_ok() && u32::try_from(*realm).is_ok() => Some(*owner),
-        _ => None,
-    }
+fn valid_village_payload(intent: &Intent) -> bool {
+    command_matches(intent)
+        && match intent.arguments.as_slice() {
+            [_, pass, realm] => u16::try_from(*pass).is_ok() && u32::try_from(*realm).is_ok(),
+            _ => false,
+        }
 }
 
 async fn read_token(
@@ -275,21 +261,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn village_admission_binds_the_pass_owner_and_rejects_malformed_claims() {
+    async fn village_admission_requires_a_binding_and_canonical_payload() {
         let checks =
             SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
         let policy = [123u64.into(), Felt::ZERO, Felt::ZERO, Felt::ZERO, 1300u64.into()];
-        let fields = vec![15u64.into(), policy[0], u16::MAX.into(), u32::MAX.into()];
+        let fields = vec![15u64.into(), u16::MAX.into(), u32::MAX.into()];
         let valid = action(fields.clone());
         assert!(checks.is_settlement(&valid));
         assert!(checks.verify(&valid, &policy).await.unwrap());
         let retained = Intent::decode(&valid.encode().unwrap()).unwrap();
-        assert_eq!(village_owner(&retained), Some(policy[0]));
-        for (index, replacement) in [
-            (1, Felt::from(456u64)),
-            (2, Felt::from(u64::from(u16::MAX) + 1)),
-            (3, Felt::from(u64::from(u32::MAX) + 1)),
-        ] {
+        assert!(valid_village_payload(&retained));
+        for (index, replacement) in [(1, Felt::from(u64::from(u16::MAX) + 1)), (2, Felt::from(u64::from(u32::MAX) + 1))]
+        {
             let mut invalid = fields.clone();
             invalid[index] = replacement;
             assert!(!checks.verify(&action(invalid), &policy).await.unwrap());
@@ -325,7 +308,6 @@ mod tests {
         let fields = vec![
             11u64.into(),
             99u64.into(),
-            123u64.into(),
             Felt::from_hex_unchecked("0xabc"),
             Felt::TWO,
             Felt::ONE,
@@ -339,7 +321,7 @@ mod tests {
         assert_eq!(claims.tokens[0].id, 19);
         assert_eq!(claims.tokens[0].attributes, 321);
         let mut changed = valid.clone();
-        changed.arguments[8] = 777u64.into();
+        changed.arguments[7] = 777u64.into();
         assert!(Claims::decode(&changed).is_none());
         for length in 0..fields.len() {
             assert!(Claims::decode(&action(fields[..length].to_vec())).is_none());
@@ -348,29 +330,26 @@ mod tests {
         extended.push(Felt::ZERO);
         assert!(Claims::decode(&action(extended)).is_none());
         let mut invalid_bool = fields.clone();
-        invalid_bool[9] = Felt::TWO;
+        invalid_bool[8] = Felt::TWO;
         assert!(Claims::decode(&action(invalid_bool)).is_none());
         let mut too_wide = fields;
-        too_wide[8] = Felt::from_hex_unchecked("0x100000000000000000000000000000000");
+        too_wide[7] = Felt::from_hex_unchecked("0x100000000000000000000000000000000");
         assert!(Claims::decode(&action(too_wide)).is_none());
     }
 
     #[tokio::test]
-    async fn season_admission_binds_the_wallet_and_canonical_option_payload() {
+    async fn season_admission_requires_a_binding_and_canonical_option_payload() {
         let checks =
             SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
         let policy = [123u64.into(), Felt::ZERO, Felt::ZERO, Felt::ZERO, 1300u64.into()];
         for suffix in [vec![Felt::ONE], vec![Felt::ZERO, 87u64.into()]] {
-            let mut fields = vec![14u64.into(), 99u64.into(), 123u64.into()];
+            let mut fields = vec![14u64.into(), 99u64.into()];
             fields.extend(suffix);
             let valid = action(fields.clone());
             assert!(checks.is_settlement(&valid));
             assert!(checks.verify(&valid, &policy).await.unwrap());
             let retained = Intent::decode(&valid.encode().unwrap()).unwrap();
-            assert_eq!(season_owner(&retained), Some(policy[0]));
-            fields[2] = 456u64.into();
-            assert!(!checks.verify(&action(fields.clone()), &policy).await.unwrap());
-            fields[2] = 123u64.into();
+            assert!(valid_season_payload(&retained));
             fields.push(Felt::ZERO);
             assert!(!checks.verify(&action(fields), &policy).await.unwrap());
             let mut changed = valid;
@@ -379,20 +358,19 @@ mod tests {
         }
         for suffix in [vec![], vec![Felt::ZERO], vec![Felt::TWO], vec![Felt::ZERO, Felt::from(u64::from(u32::MAX) + 1)]]
         {
-            let mut fields = vec![14u64.into(), 99u64.into(), 123u64.into()];
+            let mut fields = vec![14u64.into(), 99u64.into()];
             fields.extend(suffix);
             assert!(!checks.verify(&action(fields), &policy).await.unwrap());
         }
     }
 
     #[tokio::test]
-    async fn disabled_cosmetics_preserve_ignored_tokens_but_require_the_bound_owner() {
+    async fn disabled_cosmetics_preserve_ignored_tokens_but_require_a_bound_actor() {
         let checks =
             SettlementChecks { tag: 11u64.into(), season_tag: 14u64.into(), village_tag: 15u64.into(), l2: None };
         let action = action(vec![
             11u64.into(),
             99u64.into(),
-            123u64.into(),
             Felt::from_hex_unchecked("0xabc"),
             Felt::TWO,
             Felt::ONE,
@@ -407,7 +385,7 @@ mod tests {
             .await
             .unwrap());
         assert!(!checks
-            .verify(&action, &[789u64.into(), Felt::ZERO, Felt::ONE, Felt::ZERO, 1300u64.into()])
+            .verify(&action, &[Felt::ZERO, Felt::ZERO, Felt::ONE, Felt::ZERO, 1300u64.into()])
             .await
             .unwrap());
     }
@@ -476,7 +454,6 @@ mod tests {
         let proposal = action(vec![
             11u64.into(),
             99u64.into(),
-            123u64.into(),
             Felt::from_hex_unchecked("0xabc"),
             Felt::TWO,
             Felt::ONE,
@@ -488,10 +465,10 @@ mod tests {
         let policy = [123u64.into(), 11u64.into(), 12u64.into(), 3u64.into(), 1300u64.into()];
         assert!(checks.verify(&proposal, &policy).await.unwrap());
         let mut stale_snapshot = proposal.arguments.clone();
-        stale_snapshot[4] = Felt::ONE;
+        stale_snapshot[3] = Felt::ONE;
         assert!(!checks.verify(&action(stale_snapshot), &policy).await.unwrap());
         let mut wrong_hash = proposal.arguments.clone();
-        wrong_hash[3] = Felt::ONE;
+        wrong_hash[2] = Felt::ONE;
         assert!(!checks.verify(&action(wrong_hash), &policy).await.unwrap());
         source.finalized.store(false, Ordering::SeqCst);
         assert!(checks.verify(&proposal, &policy).await.is_err(), "L2-only acceptance is insufficient");
@@ -505,7 +482,7 @@ mod tests {
         let recovered = Intent::decode(&retained).unwrap();
         assert_eq!(recovered, proposal);
         let claims = Claims::decode(&recovered).unwrap();
-        assert_eq!(claims.owner, 123u64.into());
+        assert_eq!(claims.tokens[0].owner, 123u64.into());
         assert_eq!(claims.block_hash, Felt::from_hex_unchecked("0xabc"));
         assert_eq!(claims.block_number, 2);
         assert_eq!(Claims::decode(&recovered).unwrap().tokens[0].attributes, 321);
@@ -537,7 +514,6 @@ mod tests {
         let proposal = action(vec![
             11u64.into(),
             99u64.into(),
-            123u64.into(),
             Felt::from_hex_unchecked("0xabc"),
             Felt::TWO,
             Felt::ONE,

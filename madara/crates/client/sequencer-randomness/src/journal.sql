@@ -3,7 +3,7 @@ REVOKE ALL ON SCHEMA randomness FROM PUBLIC;
 
 CREATE TABLE randomness.stream (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-    version integer NOT NULL CHECK (version = 1),
+    version integer NOT NULL CHECK (version = 2),
     epoch bigint NOT NULL CHECK (epoch > 0),
     writer name NOT NULL,
     accepted_order bigint NOT NULL DEFAULT 0,
@@ -11,16 +11,16 @@ CREATE TABLE randomness.stream (
     binding bytea NOT NULL DEFAULT decode(repeat('00',32),'hex'),
     state bytea NOT NULL DEFAULT decode(repeat('00',32),'hex')
 );
-INSERT INTO randomness.stream(version, epoch, writer) VALUES (1, 1, 'randomness_writer_1');
+INSERT INTO randomness.stream(version, epoch, writer) VALUES (2, 1, 'randomness_writer_1');
 
 CREATE TABLE randomness.tickets (
     action bytea PRIMARY KEY CHECK (octet_length(action) = 32),
     nonce_key bytea NOT NULL UNIQUE CHECK (octet_length(nonce_key) = 160),
     ticket_order bigint NOT NULL UNIQUE CHECK (ticket_order > 0),
     intent bytea NOT NULL,
-    context bytea NOT NULL CHECK (octet_length(context) = 288),
+    context bytea NOT NULL CHECK (octet_length(context) = 256),
     auth_witness bytea NOT NULL CHECK (octet_length(auth_witness) = 96),
-    envelope bytea CHECK (octet_length(envelope) = 352),
+    envelope bytea CHECK (octet_length(envelope) = 320),
     binding bytea CHECK (octet_length(binding) = 32),
     status text NOT NULL CHECK (status IN ('proposed','committed','submitted','executed','terminal-rejected','consumed')),
     result bytea CHECK (octet_length(result) = 32),
@@ -36,6 +36,13 @@ CREATE TABLE randomness.submissions (
     action bytea NOT NULL REFERENCES randomness.tickets(action),
     epoch bigint NOT NULL,
     transaction_bytes bytea NOT NULL
+);
+
+CREATE TABLE randomness.key_rotation (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    transaction_hash bytea NOT NULL CHECK (octet_length(transaction_hash) = 32),
+    transaction_bytes bytea NOT NULL,
+    integrity bytea NOT NULL
 );
 
 CREATE FUNCTION randomness.require_writer(expected_epoch bigint) RETURNS void
@@ -65,11 +72,11 @@ BEGIN
         RETURN false;
     END IF;
     IF n <> head.accepted_order + 1 OR head.executed_order <> head.accepted_order
-        OR EXISTS (SELECT 1 FROM randomness.tickets WHERE status = 'proposed') THEN
+        OR EXISTS (SELECT 1 FROM randomness.tickets WHERE status = 'proposed')
+        OR EXISTS (SELECT 1 FROM randomness.key_rotation) THEN
         RAISE EXCEPTION 'unresolved ordered predecessor';
     END IF;
-    IF substring(recorded_context FROM 129 FOR 32) <> head.binding
-        OR substring(recorded_context FROM 161 FOR 32) <> head.state THEN
+    IF substring(recorded_context FROM 129 FOR 32) <> head.state THEN
         RAISE EXCEPTION 'recorded predecessor mismatch';
     END IF;
     INSERT INTO randomness.tickets(action,nonce_key,ticket_order,intent,context,auth_witness,status,integrity)
@@ -90,7 +97,7 @@ BEGIN
         RETURN;
     END IF;
     IF ticket.ticket_order <> head.accepted_order + 1
-        OR substring(recorded_envelope FROM 1 FOR 288) <> ticket.context THEN
+        OR substring(recorded_envelope FROM 1 FOR 256) <> ticket.context THEN
         RAISE EXCEPTION 'acceptance binding mismatch';
     END IF;
     UPDATE randomness.tickets SET envelope = recorded_envelope, binding = bound, status = 'committed',
@@ -172,6 +179,44 @@ BEGIN
     UPDATE randomness.submissions SET epoch = expected_epoch
         WHERE transaction_hash = tx AND action = id AND epoch = expected_epoch;
     IF NOT FOUND THEN RAISE EXCEPTION 'unregistered or fenced transaction'; END IF;
+END;
+$$;
+
+CREATE FUNCTION randomness.begin_key_rotation(expected_epoch bigint, tx bytea, payload bytea) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
+DECLARE head randomness.stream;
+BEGIN
+    SELECT * INTO STRICT head FROM randomness.stream FOR UPDATE;
+    PERFORM randomness.require_writer(expected_epoch);
+    IF head.accepted_order <> head.executed_order
+        OR EXISTS (SELECT 1 FROM randomness.tickets WHERE status = 'proposed') THEN
+        RAISE EXCEPTION 'key rotation waits for accepted actions';
+    END IF;
+    INSERT INTO randomness.key_rotation VALUES(true,tx,payload,sha256(tx || payload));
+END;
+$$;
+
+CREATE FUNCTION randomness.pending_key_rotation(expected_epoch bigint) RETURNS SETOF randomness.key_rotation
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
+DECLARE rotation randomness.key_rotation;
+BEGIN
+    PERFORM randomness.require_writer(expected_epoch);
+    FOR rotation IN SELECT * FROM randomness.key_rotation LOOP
+        IF rotation.integrity <> sha256(rotation.transaction_hash || rotation.transaction_bytes) THEN
+            RAISE EXCEPTION 'corrupted key rotation';
+        END IF;
+        RETURN NEXT rotation;
+    END LOOP;
+END;
+$$;
+
+CREATE FUNCTION randomness.finish_key_rotation(expected_epoch bigint, tx bytea) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
+BEGIN
+    PERFORM 1 FROM randomness.stream FOR UPDATE;
+    PERFORM randomness.require_writer(expected_epoch);
+    DELETE FROM randomness.key_rotation WHERE transaction_hash = tx;
+    IF NOT FOUND THEN RAISE EXCEPTION 'key rotation mismatch'; END IF;
 END;
 $$;
 

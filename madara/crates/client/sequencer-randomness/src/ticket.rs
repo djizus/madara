@@ -33,7 +33,6 @@ pub enum TicketError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     pub order: u64,
-    pub predecessor: Felt,
     pub preceding_state: Felt,
     pub timestamp: u64,
     pub execution_config: Felt,
@@ -86,7 +85,6 @@ impl Ticket {
         }
         let context = Context {
             order: envelope.order,
-            predecessor: envelope.predecessor,
             preceding_state: envelope.preceding_state,
             timestamp: envelope.timestamp,
             execution_config: envelope.execution_config,
@@ -142,7 +140,6 @@ impl Ticket {
         self.envelope = Some(Envelope {
             action: self.intent.identity()?,
             order: self.context.order,
-            predecessor: self.context.predecessor,
             preceding_state: self.context.preceding_state,
             timestamp: self.context.timestamp,
             execution_config: self.context.execution_config,
@@ -228,7 +225,6 @@ mod tests {
             },
             Context {
                 order: 1,
-                predecessor: Felt::ZERO,
                 preceding_state: Felt::ZERO,
                 timestamp: 1005,
                 execution_config: Felt::ONE,

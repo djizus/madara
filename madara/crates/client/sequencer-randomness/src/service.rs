@@ -85,9 +85,14 @@ struct ActionStatus {
 }
 
 struct HttpState {
-    admissions: mpsc::Sender<AdmissionRequest>,
+    admissions: mpsc::Sender<Work>,
     journal: Journal,
     provider: JsonRpcClient<HttpTransport>,
+}
+
+enum Work {
+    Action(AdmissionRequest),
+    Rotate { transaction: Box<BroadcastedInvokeTransaction>, response: oneshot::Sender<Result<Felt, StatusCode>> },
 }
 
 struct AdmissionRequest {
@@ -150,6 +155,7 @@ pub async fn run() -> anyhow::Result<()> {
     });
     let router = Router::new()
         .route("/actions", post(admit))
+        .route("/key-rotations", post(rotate))
         .route("/actions/:action", get(action_status))
         .with_state(state)
         .layer(middleware::from_fn(browser_access));
@@ -180,7 +186,19 @@ async fn admit(
     let (response, receiver) = oneshot::channel();
     state
         .admissions
-        .try_send(AdmissionRequest { action, response, received: Instant::now() })
+        .try_send(Work::Action(AdmissionRequest { action, response, received: Instant::now() }))
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    receiver.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.map(Json)
+}
+
+async fn rotate(
+    State(state): State<Arc<HttpState>>,
+    Json(transaction): Json<BroadcastedInvokeTransaction>,
+) -> Result<Json<Felt>, StatusCode> {
+    let (response, receiver) = oneshot::channel();
+    state
+        .admissions
+        .try_send(Work::Rotate { transaction: Box::new(transaction), response })
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     receiver.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.map(Json)
 }
@@ -192,14 +210,16 @@ async fn action_status(
     let action = Felt::from_hex(&action).map_err(|_| StatusCode::BAD_REQUEST)?;
     let record = state.journal.find_record(action).await.map_err(status_unavailable)?.ok_or(StatusCode::NOT_FOUND)?;
     let submissions = state.journal.submissions(action).await.map_err(status_unavailable)?;
-    // A retained transaction is not necessarily broadcast. During recovery several credentials
-    // may have signed the same ticket; only a hash known to the chain is useful to the client.
+    // Only the receipt carrying the recorded outcome completes the action. An earlier
+    // reverted execution may precede the transaction recording its terminal rejection.
     let mut transaction_hash = None;
     for submission in submissions {
-        match state.provider.get_transaction_status(submission.transaction_hash).await {
-            Ok(_) => {
-                transaction_hash = Some(submission.transaction_hash);
-                break;
+        match state.provider.get_transaction_receipt(submission.transaction_hash).await {
+            Ok(receipt) => {
+                if crate::execution::receipt_outcome(&record, &receipt.receipt).map_err(status_unavailable)?.is_some() {
+                    transaction_hash = Some(submission.transaction_hash);
+                    break;
+                }
             }
             Err(ProviderError::StarknetError(StarknetError::TransactionHashNotFound)) => {}
             Err(error) => return Err(status_unavailable(error)),
@@ -214,8 +234,16 @@ fn status_unavailable(error: impl std::fmt::Display) -> StatusCode {
 }
 
 impl Service {
-    async fn work(&mut self, mut receiver: mpsc::Receiver<AdmissionRequest>) -> anyhow::Result<()> {
-        while let Some(request) = receiver.recv().await {
+    async fn work(&mut self, mut receiver: mpsc::Receiver<Work>) -> anyhow::Result<()> {
+        while let Some(work) = receiver.recv().await {
+            let request = match work {
+                Work::Action(request) => request,
+                Work::Rotate { transaction, response } => {
+                    let result = self.rotate(*transaction).await?;
+                    let _ = response.send(result);
+                    continue;
+                }
+            };
             let queue_ms = request.received.elapsed().as_secs_f64() * 1000.0;
             // Invalid intent never enters the journal. Storage or execution ambiguity stops the worker.
             let intent = match Intent::decode(&request.action.intent) {
@@ -240,6 +268,28 @@ impl Service {
             self.execute(record).await?;
         }
         bail!("admission channel closed")
+    }
+
+    async fn rotate(&self, transaction: BroadcastedInvokeTransaction) -> anyhow::Result<Result<Felt, StatusCode>> {
+        let hash = match crate::rotation::validate(
+            self.account.provider(),
+            self.config.deployment,
+            self.account.chain_id(),
+            &transaction,
+        )
+        .await
+        {
+            Ok(hash) => hash,
+            Err(error) => {
+                tracing::warn!(target: "sequencer_randomness", %error, "key rotation refused");
+                return Ok(Err(StatusCode::BAD_REQUEST));
+            }
+        };
+        self.journal.begin_key_rotation(hash, &serde_json::to_vec(&transaction)?).await?;
+        let (_, success) = crate::rotation::resume(self.account.provider(), &self.journal, self.account.chain_id())
+            .await?
+            .context("rotation disappeared before execution")?;
+        Ok(if success { Ok(hash) } else { Err(StatusCode::UNPROCESSABLE_ENTITY) })
     }
 
     async fn view(&self, name: &str, calldata: Vec<Felt>) -> anyhow::Result<Vec<Felt>> {
@@ -283,7 +333,7 @@ impl Service {
         let Some(fields) = self.admission_view("get_admission", vec![intent.game, intent.actor]).await? else {
             return Ok(Err(StatusCode::BAD_REQUEST));
         };
-        let [key, rules, config, nonce, order, predecessor, state, observed_time] = fields.as_slice() else {
+        let [key, rules, config, nonce, order, state, observed_time] = fields.as_slice() else {
             bail!("malformed native admission context");
         };
         if !admission_state_matches(&intent, *rules, *nonce) {
@@ -300,7 +350,6 @@ impl Service {
         }
         let context = TicketContext {
             order: (*order).try_into()?,
-            predecessor: *predecessor,
             preceding_state: *state,
             timestamp,
             execution_config: *config,
@@ -350,39 +399,68 @@ impl Service {
         Ok(None)
     }
 
-    async fn result(&self, order: u64) -> anyhow::Result<Option<(ChainProgress, bool)>> {
-        let fields = self.view("get_result", vec![order.into()]).await?;
-        let [status, binding, result, state] = fields.as_slice() else {
-            bail!("malformed native execution result");
+    async fn head(&self) -> anyhow::Result<(u64, u64, Felt)> {
+        let fields = self.view("get_head", vec![]).await?;
+        let [order, timestamp, state] = fields.as_slice() else {
+            bail!("malformed recorded head");
         };
-        if *status == Felt::ZERO {
-            if [binding, result, state].iter().any(|value| **value != Felt::ZERO) {
-                bail!("unexecuted order contains a result");
+        Ok(((*order).try_into()?, (*timestamp).try_into()?, *state))
+    }
+
+    async fn result(&self, record: &Record) -> anyhow::Result<Option<(ChainProgress, bool)>> {
+        for submission in self.journal.submissions(record.envelope.action).await? {
+            let transaction: BroadcastedInvokeTransaction = serde_json::from_slice(&submission.bytes)?;
+            let execution = crate::submission::decode_execution(
+                &transaction.broadcasted_invoke_txn_v3.calldata,
+                self.config.deployment,
+            )?;
+            if execution.intent != record.intent || execution.envelope != record.envelope {
+                bail!("retained transaction does not match accepted binding");
             }
-            return Ok(None);
+            let receipt = match self.account.provider().get_transaction_receipt(submission.transaction_hash).await {
+                Ok(receipt) => receipt,
+                Err(ProviderError::StarknetError(StarknetError::TransactionHashNotFound)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if *receipt.receipt.transaction_hash() != submission.transaction_hash {
+                bail!("receipt transaction hash mismatch");
+            }
+            if let Some(outcome) = crate::execution::receipt_outcome(record, &receipt.receipt)? {
+                return Ok(Some(outcome));
+            }
         }
-        if *status != Felt::ONE && *status != Felt::TWO {
-            bail!("unknown execution status");
-        }
-        Ok(Some((ChainProgress { order, binding: *binding, state: *state, result: *result }, *status == Felt::TWO)))
+        Ok(None)
     }
 
     async fn recover(&mut self) -> anyhow::Result<()> {
         let prefix = self.journal.accepted_prefix().await?;
-        let mut chain = Vec::new();
-        for record in &prefix {
-            match self.result(record.envelope.order).await? {
-                Some((progress, _)) => chain.push(progress),
-                None => break,
+        let chain = loop {
+            let head = self.head().await?;
+            if head.0 > prefix.len() as u64 {
+                bail!("chain extends beyond retained journal");
             }
-        }
-        if self.result(prefix.len() as u64 + 1).await?.is_some() {
-            bail!("chain extends beyond retained journal");
-        }
+            let mut chain = Vec::new();
+            for record in prefix.iter().take(head.0 as usize) {
+                match self.result(record).await? {
+                    Some((progress, _)) => chain.push(progress),
+                    None => break,
+                }
+            }
+            // An observed head without its receipt is incomplete evidence, never a rejection.
+            if chain.len() == head.0 as usize && self.head().await? == head {
+                let expected = chain.last().map_or(Felt::ZERO, |progress| progress.state);
+                if expected != head.2 {
+                    bail!("receipt prefix does not match recorded head");
+                }
+                break chain;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         let records = self.journal.recover(&chain).await?;
         for record in records {
             self.execute(record).await?;
         }
+        crate::rotation::resume(self.account.provider(), &self.journal, self.account.chain_id()).await?;
         Ok(())
     }
 
@@ -528,16 +606,18 @@ impl Service {
 
 impl ExecutionIo for Service {
     async fn outcome(&self, record: &Record) -> anyhow::Result<Observation> {
-        let head = self.view("execution_head", vec![]).await?;
-        let [order, _, _, _, _, _] = head.as_slice() else {
-            bail!("malformed recorded head");
-        };
-        if *order < Felt::from(record.envelope.order) {
+        let (order, timestamp, state) = self.head().await?;
+        if order < record.envelope.order {
             return Ok(Observation::Unexecuted);
         }
-        Ok(match self.result(record.envelope.order).await? {
-            Some((progress, rejected)) => Observation::Recorded(progress, rejected),
-            // RPC views crossed a head update. Do not submit against an inconsistent view.
+        Ok(match self.result(record).await? {
+            Some((progress, rejected)) => {
+                if order == progress.order && (state != progress.state || timestamp != record.envelope.timestamp) {
+                    // The receipt and head may straddle a pre-confirmation change. Reconcile again.
+                    return Ok(Observation::Stale);
+                }
+                Observation::Recorded(progress, rejected)
+            }
             None => Observation::Stale,
         })
     }
@@ -566,10 +646,10 @@ fn admission_survived_external_checks(
     before: &[Felt],
     after: &[Felt],
 ) -> anyhow::Result<bool> {
-    if before.len() != 8 || after.len() != 8 {
+    if before.len() != 7 || after.len() != 7 {
         bail!("malformed native admission context");
     }
-    Ok(before[..7] == after[..7] && admission_time_is_valid(intent, recorded, after[7].try_into()?))
+    Ok(before[..6] == after[..6] && admission_time_is_valid(intent, recorded, after[6].try_into()?))
 }
 
 // Host time is telemetry only. Neither a long outage nor a broken host clock cancels accepted work.
@@ -638,18 +718,18 @@ mod tests {
         assert!(!admission_time_is_valid(&intent, 999, 1005));
         assert!(!admission_time_is_valid(&intent, 1006, 1005));
         assert!(timestamp_in_bounds(1005, 1005 + 86400));
-        let before = [Felt::ONE, Felt::ONE, Felt::ONE, Felt::ZERO, Felt::ONE, Felt::ZERO, Felt::ONE, 1005u64.into()];
+        let before = [Felt::ONE, Felt::ONE, Felt::ONE, Felt::ZERO, Felt::ONE, Felt::ONE, 1005u64.into()];
         let mut after = before;
-        after[7] = 1010u64.into();
+        after[6] = 1010u64.into();
         assert!(admission_survived_external_checks(&intent, 1005, &before, &after).unwrap());
-        after[7] = 1011u64.into();
+        after[6] = 1011u64.into();
         assert!(!admission_survived_external_checks(&intent, 1005, &before, &after).unwrap());
-        for index in 0..7 {
+        for index in 0..6 {
             let mut changed = before;
             changed[index] += Felt::ONE;
             assert!(!admission_survived_external_checks(&intent, 1005, &before, &changed).unwrap());
         }
-        assert!(admission_survived_external_checks(&intent, 1005, &before, &before[..7]).is_err());
+        assert!(admission_survived_external_checks(&intent, 1005, &before, &before[..6]).is_err());
     }
 
     #[test]

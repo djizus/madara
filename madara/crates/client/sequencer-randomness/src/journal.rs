@@ -95,6 +95,39 @@ impl Drop for Journal {
 }
 
 impl Journal {
+    pub async fn begin_key_rotation(&self, transaction: Felt, bytes: &[u8]) -> Result<(), JournalError> {
+        self.primary
+            .query_one(
+                "SELECT randomness.begin_key_rotation($1,$2,$3)",
+                &[&self.epoch, &transaction.to_bytes_be().to_vec(), &bytes],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn pending_key_rotation(&self) -> Result<Option<(Felt, Vec<u8>)>, JournalError> {
+        let row = self.primary.query_opt("SELECT * FROM randomness.pending_key_rotation($1)", &[&self.epoch]).await?;
+        row.map(|row| {
+            let bytes: Vec<u8> = row.get("transaction_hash");
+            let hash = decode_bytes(&bytes)?;
+            if hash.len() != 1 {
+                return Err(JournalError::Prefix);
+            }
+            Ok((hash[0], row.get("transaction_bytes")))
+        })
+        .transpose()
+    }
+
+    pub async fn finish_key_rotation(&self, transaction: Felt) -> Result<(), JournalError> {
+        self.primary
+            .query_one(
+                "SELECT randomness.finish_key_rotation($1,$2)",
+                &[&self.epoch, &transaction.to_bytes_be().to_vec()],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn authorize_submission(
         &self,
         envelope: &Envelope,
@@ -191,7 +224,7 @@ impl Journal {
         let auth = encode_bytes(&[authorization.public_key, authorization.r, authorization.s]);
         let order = i64::try_from(context.order).map_err(|_| JournalError::Capacity)?;
         let proposal = context_envelope(action, context);
-        let context_bytes = encode_bytes(&proposal.encode()?[..9]);
+        let context_bytes = encode_bytes(&proposal.encode()?[..8]);
         let id = action.to_bytes_be().to_vec();
         let created: bool = self
             .primary
@@ -354,7 +387,6 @@ fn context_envelope(action: Felt, context: &Context) -> Envelope {
     Envelope {
         action,
         order: context.order,
-        predecessor: context.predecessor,
         preceding_state: context.preceding_state,
         timestamp: context.timestamp,
         execution_config: context.execution_config,
@@ -366,7 +398,6 @@ fn context_envelope(action: Felt, context: &Context) -> Envelope {
 fn context_from_envelope(envelope: &Envelope) -> Context {
     Context {
         order: envelope.order,
-        predecessor: envelope.predecessor,
         preceding_state: envelope.preceding_state,
         timestamp: envelope.timestamp,
         execution_config: envelope.execution_config,
@@ -392,7 +423,7 @@ fn decode_record(row: &Row) -> Result<Record, JournalError> {
         || envelope.action != felt_bytes(row.get("action"))?
         || envelope.binding()? != felt_bytes(row.get("binding"))?
         || i64::try_from(envelope.order).map_err(|_| JournalError::Capacity)? != row.get::<_, i64>("ticket_order")
-        || encode_bytes(&envelope.encode()?[..9]) != row.get::<_, Vec<u8>>("context")
+        || encode_bytes(&envelope.encode()?[..8]) != row.get::<_, Vec<u8>>("context")
         || encode_bytes(&[intent.chain, intent.deployment, intent.game, intent.actor, intent.nonce.into()])
             != row.get::<_, Vec<u8>>("nonce_key")
     {
@@ -424,14 +455,12 @@ pub fn verify_prefix(records: &[Record], chain: &[ChainProgress]) -> Result<(), 
     if chain.len() > records.len() {
         return Err(JournalError::Prefix);
     }
-    let mut predecessor = Felt::ZERO;
     let mut state = Felt::ZERO;
     let mut nonces = HashSet::new();
     for (index, record) in records.iter().enumerate() {
         let envelope = &record.envelope;
         let intent = &record.intent;
         if envelope.order != index as u64 + 1
-            || envelope.predecessor != predecessor
             || envelope.preceding_state != state
             || envelope.action != intent.identity()?
             || !nonces.insert([intent.chain, intent.deployment, intent.game, intent.actor, intent.nonce.into()])
@@ -451,7 +480,6 @@ pub fn verify_prefix(records: &[Record], chain: &[ChainProgress]) -> Result<(), 
         } else if record.result.is_some() || record.state == State::Consumed || index + 1 != records.len() {
             return Err(JournalError::Prefix);
         }
-        predecessor = binding;
     }
     Ok(())
 }
