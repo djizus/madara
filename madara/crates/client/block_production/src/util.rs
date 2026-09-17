@@ -119,9 +119,22 @@ impl FromIterator<(Transaction, AdditionalTxInfo)> for BatchToExecute {
 
 #[derive(Debug, Default)]
 pub(crate) struct AdditionalTxInfo {
+    #[cfg(feature = "sequencer-randomness")]
+    pub refusal_reporter: Option<mc_sequencer_randomness::submission::RefusalReporter>,
     pub declared_class: Option<ConvertedClass>,
     /// Earliest known timestamp for this transaction. Used for mempool re-insertion.
     pub arrived_at: TxTimestamp,
+}
+
+impl AdditionalTxInfo {
+    pub fn new(declared_class: Option<ConvertedClass>, arrived_at: TxTimestamp) -> Self {
+        Self {
+            declared_class,
+            arrived_at,
+            #[cfg(feature = "sequencer-randomness")]
+            refusal_reporter: None,
+        }
+    }
 }
 
 /// This is a pending header, without parent_block_hash. Parent block hash is not visible to the execution,

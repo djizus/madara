@@ -1,8 +1,9 @@
 use crate::{
+    execution::{deterministic_refusal, included_failure, Attempt, ExecutionIo, Observation},
     journal::{Authorization, ChainProgress, Journal, Record},
     protocol::Intent,
     settlement::SettlementChecks,
-    submission::execution_calldata,
+    submission::{execution_calldata, SubmissionKind},
     ticket::{timestamp_in_bounds, Context as TicketContext, State as TicketState},
 };
 use anyhow::{bail, Context};
@@ -18,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use starknet_accounts::{Account, ConnectedAccount, ExecutionEncoding, SingleOwnerAccount};
 use starknet_core::{
     types::{
-        BlockId, BlockTag, BroadcastedInvokeTransaction, Call, ExecutionResult, Felt, FunctionCall,
-        MaybePreConfirmedBlockWithTxHashes, StarknetError, TransactionStatus,
+        BlockId, BlockTag, BroadcastedInvokeTransaction, Call, Felt, FunctionCall, MaybePreConfirmedBlockWithTxHashes,
+        StarknetError,
     },
     utils::get_selector_from_name,
 };
@@ -129,7 +130,16 @@ pub async fn run() -> anyhow::Result<()> {
     let l2 = std::env::var("RANDOMNESS_L2_RPC_URL").ok().filter(|url| !url.is_empty());
     let settlement = SettlementChecks::load(&schema, l2.as_deref())?;
     let mut service = Service { config, account, journal, settlement };
-    service.recover().await?;
+    loop {
+        match service.recover().await {
+            Ok(()) => break,
+            Err(error) if error.downcast_ref::<ProviderError>().is_some() => {
+                tracing::warn!(target: "sequencer_randomness", %error, "recovery transport unavailable; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let address: SocketAddr = required("RANDOMNESS_HTTP_BIND")?.parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let (sender, receiver) = mpsc::channel(64);
@@ -380,81 +390,109 @@ impl Service {
         if record.state == TicketState::Consumed {
             return Ok(());
         }
-        if let Some((progress, rejected)) = self.result(record.envelope.order).await? {
-            return self.complete(&record, progress, rejected).await;
-        }
         report_execution_lag(&record, SystemTime::now());
-        let transaction = self.submit(&record).await?;
-        tokio::time::timeout(Duration::from_secs(300), async {
-            loop {
-                if let Some((progress, rejected)) = self.result(record.envelope.order).await? {
-                    return self.complete(&record, progress, rejected).await;
-                }
-                require_unreverted(&self.account.provider().get_transaction_status(transaction).await?)?;
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .context("pending ticket stopped without a fresh draw")?
+        crate::execution::execute(self, &record).await
     }
 
-    async fn submit(&self, record: &Record) -> anyhow::Result<Felt> {
+    async fn submit(&self, record: &Record, requested: SubmissionKind) -> anyhow::Result<Attempt> {
         let retained = self.journal.submissions(record.envelope.action).await?;
-        for submission in retained.iter().filter(|submission| submission.action == record.envelope.action) {
-            match self.account.provider().get_transaction_status(submission.transaction_hash).await {
-                Ok(status) => {
-                    require_unreverted(&status)?;
-                    return Ok(submission.transaction_hash);
-                }
-                Err(ProviderError::StarknetError(StarknetError::TransactionHashNotFound)) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if let Some(submission) = retained
-            .iter()
-            .rev()
-            .find(|submission| submission.action == record.envelope.action && submission.epoch == self.config.epoch)
-        {
+        // The journal returns hashes in key order, not attempt order. Once a rejection
+        // transaction is durable, recovery must never return to executing gameplay.
+        let mut attempts = Vec::new();
+        for submission in retained {
             let transaction: BroadcastedInvokeTransaction = serde_json::from_slice(&submission.bytes)?;
-            let (expected_hash, expected) =
-                self.prepare_transaction(record, transaction.broadcasted_invoke_txn_v3.nonce).await?;
-            if expected_hash != submission.transaction_hash
-                || serde_json::to_vec(&transaction)? != serde_json::to_vec(&expected)?
-            {
-                bail!("retained transaction differs from its accepted binding");
-            }
-            let received = self.account.provider().add_invoke_transaction(transaction).await?;
-            if received.transaction_hash != expected_hash {
-                bail!("resubmission hash mismatch");
-            }
-            return Ok(expected_hash);
+            let fields = &transaction.broadcasted_invoke_txn_v3;
+            let kind = SubmissionKind::from_selector(*fields.calldata.get(2).context("missing recorded selector")?)?;
+            attempts.push(((kind == SubmissionKind::Reject, submission.epoch, fields.nonce), submission));
         }
-        self.prepare_submission(record).await
+        let Some((_, submission)) = attempts.into_iter().max_by_key(|(key, _)| *key) else {
+            return self.prepare_submission(record, requested).await;
+        };
+        let transaction: BroadcastedInvokeTransaction = serde_json::from_slice(&submission.bytes)?;
+        let fields = &transaction.broadcasted_invoke_txn_v3;
+        let kind = SubmissionKind::from_selector(*fields.calldata.get(2).context("missing recorded selector")?)?;
+        if kind == SubmissionKind::Execute
+            && submission.refusal.as_deref().is_some_and(crate::execution::deterministic_limit)
+        {
+            return self.prepare_submission(record, SubmissionKind::Reject).await;
+        }
+        if requested == SubmissionKind::Reject && kind == SubmissionKind::Execute {
+            return self.prepare_submission(record, requested).await;
+        }
+        // A fenced credential cannot submit or recover an old transport transaction.
+        // The head was reconciled before reaching this path; retain only its ticket.
+        if submission.epoch != self.config.epoch {
+            return self.prepare_submission(record, kind).await;
+        }
+        match self.account.provider().get_transaction_status(submission.transaction_hash).await {
+            Ok(status) => {
+                if included_failure(&status) {
+                    if kind == SubmissionKind::Execute {
+                        return Ok(Attempt::Failed);
+                    }
+                    // Recording failed, not gameplay. Retry the rejection without changing the ticket.
+                    return self.prepare_submission(record, kind).await;
+                }
+                return Ok(Attempt::Pending);
+            }
+            Err(ProviderError::StarknetError(StarknetError::TransactionHashNotFound)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A changed authority nonce or epoch requires a new transport transaction, never a new ticket.
+        if fields.nonce != self.account.get_nonce().await? {
+            return self.prepare_submission(record, kind).await;
+        }
+        let (hash, expected) = self.prepare_transaction(record, fields.nonce, kind).await?;
+        if hash != submission.transaction_hash || serde_json::to_vec(&transaction)? != serde_json::to_vec(&expected)? {
+            bail!("retained transaction differs from its accepted binding");
+        }
+        self.broadcast(transaction, hash, kind).await
     }
 
-    async fn prepare_submission(&self, record: &Record) -> anyhow::Result<Felt> {
+    async fn prepare_submission(&self, record: &Record, kind: SubmissionKind) -> anyhow::Result<Attempt> {
         let started = Instant::now();
         let nonce = self.account.get_nonce().await?;
-        let (hash, transaction) = self.prepare_transaction(record, nonce).await?;
+        let (hash, transaction) = self.prepare_transaction(record, nonce, kind).await?;
         self.journal.record_submission(record.envelope.action, hash, &serde_json::to_vec(&transaction)?).await?;
-        let received = self.account.provider().add_invoke_transaction(transaction).await?;
-        if received.transaction_hash != hash {
-            bail!("submission hash mismatch");
-        }
+        let outcome = self.broadcast(transaction, hash, kind).await?;
         tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
             order = record.envelope.order, transaction = %hash.to_hex_string(),
             submission_ms = started.elapsed().as_secs_f64() * 1000.0, "randomness_submission");
-        Ok(hash)
+        Ok(outcome)
+    }
+
+    async fn broadcast(
+        &self,
+        transaction: BroadcastedInvokeTransaction,
+        hash: Felt,
+        kind: SubmissionKind,
+    ) -> anyhow::Result<Attempt> {
+        match self.account.provider().add_invoke_transaction(transaction).await {
+            Ok(received) => {
+                if received.transaction_hash != hash {
+                    bail!("submission hash mismatch");
+                }
+                Ok(Attempt::Pending)
+            }
+            Err(error) if kind == SubmissionKind::Execute && deterministic_refusal(&error) => {
+                let reason = format!("{error:?}");
+                let reason = crate::execution::limit_reason(&reason).context("missing deterministic refusal reason")?;
+                self.journal.record_refusal(hash, reason).await?;
+                Ok(Attempt::Failed)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn prepare_transaction(
         &self,
         record: &Record,
         nonce: Felt,
+        kind: SubmissionKind,
     ) -> anyhow::Result<(Felt, BroadcastedInvokeTransaction)> {
         let calls = vec![Call {
             to: self.config.deployment,
-            selector: get_selector_from_name("execute")?,
+            selector: kind.selector(),
             calldata: execution_calldata(&record.intent, &record.envelope, record.authorization, self.config.epoch)?,
         }];
         let prepared = self
@@ -485,6 +523,31 @@ impl Service {
             order = record.envelope.order, persistence_ms = started.elapsed().as_secs_f64() * 1000.0,
             "randomness_result_persistence");
         Ok(())
+    }
+}
+
+impl ExecutionIo for Service {
+    async fn outcome(&self, record: &Record) -> anyhow::Result<Observation> {
+        let head = self.view("execution_head", vec![]).await?;
+        let [order, _, _, _, _, _] = head.as_slice() else {
+            bail!("malformed recorded head");
+        };
+        if *order < Felt::from(record.envelope.order) {
+            return Ok(Observation::Unexecuted);
+        }
+        Ok(match self.result(record.envelope.order).await? {
+            Some((progress, rejected)) => Observation::Recorded(progress, rejected),
+            // RPC views crossed a head update. Do not submit against an inconsistent view.
+            None => Observation::Stale,
+        })
+    }
+
+    async fn attempt(&self, record: &Record, kind: SubmissionKind) -> anyhow::Result<Attempt> {
+        self.submit(record, kind).await
+    }
+
+    async fn complete(&self, record: &Record, progress: ChainProgress, rejected: bool) -> anyhow::Result<()> {
+        Service::complete(self, record, progress, rejected).await
     }
 }
 
@@ -524,18 +587,6 @@ fn report_execution_lag(record: &Record, now: SystemTime) {
             order = record.envelope.order, execution_lag_seconds, threshold_seconds = EXECUTION_LAG_ALERT_SECONDS,
             "accepted ticket execution delayed; retaining recorded context");
     }
-}
-
-fn require_unreverted(status: &TransactionStatus) -> anyhow::Result<()> {
-    if matches!(
-        status,
-        TransactionStatus::PreConfirmed(ExecutionResult::Reverted { .. })
-            | TransactionStatus::AcceptedOnL2(ExecutionResult::Reverted { .. })
-            | TransactionStatus::AcceptedOnL1(ExecutionResult::Reverted { .. })
-    ) {
-        bail!("recorded submission reverted; stream stopped with its binding retained");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -622,26 +673,6 @@ mod tests {
         assert!(!admission_state_matches(&intent, Felt::TWO, Felt::from(7)));
         intent.nonce = u64::MAX;
         assert!(!admission_state_matches(&intent, Felt::ONE, Felt::from(u64::MAX)));
-    }
-
-    #[test]
-    fn reverted_transport_stops_at_every_finality_without_resubmitting() {
-        for status in [
-            TransactionStatus::PreConfirmed(ExecutionResult::Reverted { reason: "context".into() }),
-            TransactionStatus::AcceptedOnL2(ExecutionResult::Reverted { reason: "bounds".into() }),
-            TransactionStatus::AcceptedOnL1(ExecutionResult::Reverted { reason: "callback".into() }),
-        ] {
-            assert!(require_unreverted(&status).is_err());
-        }
-        for status in [
-            TransactionStatus::Received,
-            TransactionStatus::Candidate,
-            TransactionStatus::PreConfirmed(ExecutionResult::Succeeded),
-            TransactionStatus::AcceptedOnL2(ExecutionResult::Succeeded),
-            TransactionStatus::AcceptedOnL1(ExecutionResult::Succeeded),
-        ] {
-            assert!(require_unreverted(&status).is_ok());
-        }
     }
 
     #[test]

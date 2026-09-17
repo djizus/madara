@@ -474,6 +474,16 @@ impl ExecutorThread {
             } else {
                 0.0
             };
+            #[cfg(feature = "sequencer-randomness")]
+            let mut executed_txs = executed_txs;
+            #[cfg(feature = "sequencer-randomness")]
+            for (info, res) in executed_txs.additional_info.iter_mut().zip(blockifier_results.iter()) {
+                if let Some(reporter) = info.refusal_reporter.take() {
+                    if let Err(error) = res {
+                        reporter.report(&format!("{error:#}"));
+                    }
+                }
+            }
             for (btx, res) in executed_txs.txs.iter().zip(blockifier_results.iter()) {
                 match res {
                     Ok((execution_info, _state_diff)) => {

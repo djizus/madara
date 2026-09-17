@@ -149,6 +149,15 @@ async fn replicated_journal_rehearsal() {
     }
     journal.record_submission(action, Felt::ONE, &[1, 2, 3]).await.unwrap();
     journal.record_submission(action, Felt::TWO, &[4, 5, 6]).await.unwrap();
+    let refusal = "Exceeded the maximum data length, data length: 301, max data length: 300.";
+    journal.record_refusal(Felt::ONE, refusal).await.unwrap();
+    assert!(journal.record_refusal(Felt::from(999_u64), refusal).await.is_err());
+    assert!(stale.record_refusal(Felt::ONE, refusal).await.is_err());
+    let retained = journal.submissions(action).await.unwrap();
+    assert_eq!(retained[0].refusal.as_deref(), Some(refusal));
+    assert_eq!(retained[0].bytes, vec![1, 2, 3]);
+    assert!(retained[1].refusal.is_none());
+
     journal.authorize_submission(&record.envelope, authorization(), Felt::ONE).await.unwrap();
     assert!(journal.authorize_submission(&record.envelope, authorization(), Felt::THREE).await.is_err());
     assert!(journal.authorize_submission(&altered, authorization(), Felt::ONE).await.is_err());
@@ -177,6 +186,7 @@ async fn replicated_journal_rehearsal() {
     assert!(restarted.submissions(Felt::from(999_u64)).await.unwrap().is_empty());
     assert!(restarted.find_record(Felt::from(999_u64)).await.unwrap().is_none());
     assert_eq!(submissions[0].bytes, vec![1, 2, 3]);
+    assert_eq!(submissions[0].refusal.as_deref(), Some(refusal));
     assert_eq!(submissions[1].bytes, vec![4, 5, 6]);
     eprintln!("PASS concurrent duplicates and restart with two unresolved submission hashes");
 

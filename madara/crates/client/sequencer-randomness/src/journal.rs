@@ -74,6 +74,7 @@ pub struct Submission {
     pub transaction_hash: Felt,
     pub epoch: u64,
     pub bytes: Vec<u8>,
+    pub refusal: Option<String>,
 }
 
 /// Local connections use private container networking or authenticated SSH tunnels.
@@ -286,6 +287,16 @@ impl Journal {
         Ok(records)
     }
 
+    pub async fn record_refusal(&self, transaction: Felt, reason: &str) -> Result<(), JournalError> {
+        self.primary
+            .query_one(
+                "SELECT randomness.record_refusal($1,$2,$3)",
+                &[&self.epoch, &transaction.to_bytes_be().to_vec(), &reason],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn submissions(&self, action: Felt) -> Result<Vec<Submission>, JournalError> {
         self.require_standby().await?;
         self.standby
@@ -301,6 +312,7 @@ impl Journal {
                     transaction_hash: felt_bytes(row.get("transaction_hash"))?,
                     epoch: u64::try_from(row.get::<_, i64>("epoch")).map_err(|_| JournalError::Prefix)?,
                     bytes: row.get("transaction_bytes"),
+                    refusal: row.get("refusal"),
                 })
             })
             .collect()

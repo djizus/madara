@@ -1,5 +1,5 @@
 -- Live reads select an indexed action. Recovery still validates the entire prefix.
--- Applying this file changes read functions and an index, never retained records.
+-- Additive submission metadata preserves accepted ticket identities and roots.
 CREATE INDEX IF NOT EXISTS submissions_action_idx ON randomness.submissions(action);
 
 CREATE OR REPLACE FUNCTION randomness.records(expected_epoch bigint, requested_action bytea)
@@ -60,5 +60,26 @@ BEGIN
     SELECT stream.writer INTO STRICT writer FROM randomness.stream;
     EXECUTE format('GRANT EXECUTE ON FUNCTION randomness.records(bigint, bytea), randomness.records(bigint),
         randomness.pending_submissions(bigint, bytea), randomness.pending_submissions(bigint) TO %I', writer);
+END;
+$$;
+
+
+ALTER TABLE randomness.submissions ADD COLUMN IF NOT EXISTS refusal text;
+CREATE OR REPLACE FUNCTION randomness.record_refusal(expected_epoch bigint, tx bytea, reason text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, randomness AS $$
+BEGIN
+    PERFORM randomness.require_writer(expected_epoch);
+    IF reason IS NULL OR octet_length(reason) = 0 OR octet_length(reason) > 4096 THEN
+        RAISE EXCEPTION 'invalid execution refusal';
+    END IF;
+    UPDATE randomness.submissions SET refusal = coalesce(refusal, reason) WHERE transaction_hash = tx;
+    IF NOT FOUND THEN RAISE EXCEPTION 'refusal has no retained submission'; END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION randomness.record_refusal(bigint, bytea, text) FROM PUBLIC;
+DO $$ DECLARE writer name;
+BEGIN
+    SELECT stream.writer INTO STRICT writer FROM randomness.stream;
+    EXECUTE format('GRANT EXECUTE ON FUNCTION randomness.record_refusal(bigint, bytea, text) TO %I', writer);
 END;
 $$;

@@ -78,7 +78,7 @@ impl Batcher {
                 stream::unfold(&mut self.bypass_in, |chan| async move { chan.recv().await.map(|tx| (tx, chan)) }).map(
                     |tx| {
                         tx.into_blockifier_for_sequencing()
-                            .map(|(btx, ts, declared_class)| (btx, AdditionalTxInfo { declared_class, arrived_at: ts }))
+                            .map(|(btx, ts, declared_class)| (btx, AdditionalTxInfo::new(declared_class, ts)))
                             .map_err(anyhow::Error::from)
                     },
                 );
@@ -86,7 +86,7 @@ impl Batcher {
             let l1_txs_stream = self.l1_message_stream.as_mut().map(|res| {
                 Ok(res?.into_blockifier(chain_id, sn_version).map(|(btx, declared_class)| {
                     // L1HandlerTx timestamp is irrelevant
-                    (btx, AdditionalTxInfo { declared_class, arrived_at: TxTimestamp::now() })
+                    (btx, AdditionalTxInfo::new(declared_class, TxTimestamp::now()))
                 })?)
             });
 
@@ -98,7 +98,7 @@ impl Batcher {
             .map(|c| {
                 stream::iter(c.map(|tx| {
                     tx.into_blockifier_for_sequencing()
-                        .map(|(btx, ts, declared_class)| (btx, AdditionalTxInfo { declared_class, arrived_at: ts }))
+                        .map(|(btx, ts, declared_class)| (btx, AdditionalTxInfo::new(declared_class, ts)))
                         .map_err(anyhow::Error::from)
                 }))
             })
@@ -141,9 +141,11 @@ impl Batcher {
                 else => return anyhow::Ok(())
             };
 
+            #[cfg(feature = "sequencer-randomness")]
+            let mut batch = batch;
             if !batch.is_empty() {
                 #[cfg(feature = "sequencer-randomness")]
-                randomness::authorize_batch(&mut randomness_gate, &batch).await?;
+                randomness::authorize_batch(&mut randomness_gate, &mut batch).await?;
                 tracing::debug!("Sending batch of {} transactions to the worker thread.", batch.len());
 
                 permit.send(batch);

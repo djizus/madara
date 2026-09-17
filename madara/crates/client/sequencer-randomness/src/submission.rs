@@ -16,6 +16,33 @@ pub struct SubmissionGate {
     standby: String,
     journal: Option<Journal>,
     worker: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    refusals: tokio::sync::mpsc::Sender<(Felt, &'static str)>,
+    refusal_worker: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubmissionKind {
+    Execute,
+    Reject,
+}
+
+impl SubmissionKind {
+    pub(crate) fn selector(self) -> Felt {
+        get_selector_from_name(match self {
+            Self::Execute => "execute",
+            Self::Reject => "reject_execution",
+        })
+        .expect("static selector")
+    }
+
+    pub(crate) fn from_selector(selector: Felt) -> anyhow::Result<Self> {
+        for kind in [Self::Execute, Self::Reject] {
+            if selector == kind.selector() {
+                return Ok(kind);
+            }
+        }
+        bail!("only recorded execution or rejection is allowed")
+    }
 }
 
 pub struct Execution {
@@ -27,6 +54,24 @@ pub struct Execution {
     pub s: Felt,
 }
 
+/// Only the executor can report a deterministic refusal; an absent report never implies failure.
+#[derive(Debug)]
+pub struct RefusalReporter {
+    transaction: Felt,
+    sender: tokio::sync::mpsc::Sender<(Felt, &'static str)>,
+}
+
+impl RefusalReporter {
+    pub fn report(self, reason: &str) {
+        if let Some(reason) = crate::execution::limit_reason(reason) {
+            if self.sender.try_send((self.transaction, reason)).is_err() {
+                tracing::warn!(target: "sequencer_randomness", transaction = %self.transaction,
+                    "refusal recording queue unavailable; ticket remains pending for reconciliation");
+            }
+        }
+    }
+}
+
 impl SubmissionGate {
     pub fn from_env(chain: Felt) -> anyhow::Result<Self> {
         let config = Configuration::from_env()?;
@@ -35,6 +80,9 @@ impl SubmissionGate {
             "sidecar" => None,
             _ => bail!("RANDOMNESS_PLACEMENT must be embedded or sidecar"),
         };
+        let (refusals, receiver) = tokio::sync::mpsc::channel(64);
+        let refusal_worker =
+            tokio::spawn(record_refusals(config.primary.clone(), config.standby.clone(), config.epoch, receiver));
         Ok(Self {
             account: config.account,
             deployment: config.deployment,
@@ -44,7 +92,13 @@ impl SubmissionGate {
             standby: config.standby,
             journal: None,
             worker,
+            refusals,
+            refusal_worker,
         })
+    }
+
+    pub fn refusal_reporter(&self, transaction: Felt) -> RefusalReporter {
+        RefusalReporter { transaction, sender: self.refusals.clone() }
     }
 
     pub async fn authorize(&mut self, hash: Felt, calldata: &[Felt], l2_gas: u64, query: bool) -> anyhow::Result<()> {
@@ -84,8 +138,32 @@ impl SubmissionGate {
 
 impl Drop for SubmissionGate {
     fn drop(&mut self) {
+        self.refusal_worker.abort();
         if let Some(worker) = &self.worker {
             worker.abort();
+        }
+    }
+}
+
+async fn record_refusals(
+    primary: String,
+    standby: String,
+    epoch: u64,
+    mut receiver: tokio::sync::mpsc::Receiver<(Felt, &'static str)>,
+) {
+    while let Some((transaction, reason)) = receiver.recv().await {
+        loop {
+            let result =
+                async { Journal::connect(&primary, &standby, epoch).await?.record_refusal(transaction, reason).await }
+                    .await;
+            match result {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(target: "sequencer_randomness", %transaction, %error,
+                        "executor refusal awaiting durable recording");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
         }
     }
 }
@@ -109,13 +187,10 @@ pub fn execution_calldata(
 
 /// Standard single-call account encoding followed by execute(intent, context, r, s).
 pub fn decode_execution(calldata: &[Felt], deployment: Felt) -> anyhow::Result<Execution> {
-    if calldata.len() < 4
-        || calldata[0] != Felt::ONE
-        || calldata[1] != deployment
-        || calldata[2] != get_selector_from_name("execute")?
-    {
+    if calldata.len() < 4 || calldata[0] != Felt::ONE || calldata[1] != deployment {
         bail!("only one native execute call is allowed");
     }
+    SubmissionKind::from_selector(calldata[2])?;
     let payload_length = usize::try_from(calldata[3]).context("invalid execute length")?;
     let payload = &calldata[4..];
     if payload.len() != payload_length || payload.len() < 11 {
@@ -185,6 +260,32 @@ mod tests {
             vec![Felt::ONE, Felt::TWO, get_selector_from_name("execute").unwrap(), Felt::from(payload.len() as u64)];
         call.extend(payload);
         call
+    }
+
+    #[test]
+    fn refusal_reporting_is_bounded_and_ignores_transient_errors() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        RefusalReporter { transaction: Felt::ONE, sender: sender.clone() }.report("queue full");
+        assert!(receiver.try_recv().is_err());
+        RefusalReporter { transaction: Felt::ONE, sender: sender.clone() }
+            .report("Exceeded the maximum number of events, number events: 1001, max number events: 1000.");
+        // A saturated reporting queue never blocks the executor or invents an outcome.
+        RefusalReporter { transaction: Felt::TWO, sender }
+            .report("Exceeded the maximum data length, data length: 301, max data length: 300.");
+        assert_eq!(receiver.try_recv().unwrap(), (Felt::ONE, "Exceeded the maximum number of events,"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn rejection_transport_retains_the_original_ticket_and_witnesses() {
+        let original = call();
+        let mut rejection = original.clone();
+        rejection[2] = SubmissionKind::Reject.selector();
+        let executed = decode_execution(&original, Felt::TWO).unwrap();
+        let rejected = decode_execution(&rejection, Felt::TWO).unwrap();
+        assert!(executed.envelope == rejected.envelope);
+        assert_eq!(executed.intent.encode().unwrap(), rejected.intent.encode().unwrap());
+        assert_eq!((executed.r, executed.s), (rejected.r, rejected.s));
     }
 
     #[test]
