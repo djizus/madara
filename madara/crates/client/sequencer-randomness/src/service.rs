@@ -1,3 +1,4 @@
+use crate::admission::{AdmissionSlots, IpLimits, Permit, Slot};
 use crate::{
     execution::{deterministic_refusal, included_failure, Attempt, ExecutionIo, Observation},
     journal::{Authorization, ChainProgress, Journal, Record},
@@ -8,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use axum::{
-    extract::{Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -28,10 +29,10 @@ use starknet_providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, Provid
 use starknet_signers::{LocalWallet, SigningKey};
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 type Sequencer = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
 const EXECUTION_LAG_ALERT_SECONDS: u64 = 300;
@@ -68,12 +69,13 @@ struct ActionRequest {
     intent: Vec<Felt>,
     r: Felt,
     s: Felt,
+    public_key: Felt,
 }
 
-#[derive(Serialize)]
-struct Accepted {
-    action: Felt,
-    order: u64,
+#[derive(Clone, Serialize)]
+pub(crate) struct Accepted {
+    pub action: Felt,
+    pub order: u64,
 }
 
 /// Public recovery status contains no entropy or authorization witness.
@@ -88,16 +90,21 @@ struct HttpState {
     admissions: mpsc::Sender<Work>,
     journal: Journal,
     provider: JsonRpcClient<HttpTransport>,
+    slots: AdmissionSlots,
+    progress: watch::Sender<u64>,
+    chain: Felt,
+    deployment: Felt,
 }
 
 enum Work {
-    Action(AdmissionRequest),
+    Action(Box<AdmissionRequest>),
     Rotate { transaction: Box<BroadcastedInvokeTransaction>, response: oneshot::Sender<Result<Felt, StatusCode>> },
 }
 
 struct AdmissionRequest {
     action: ActionRequest,
-    response: oneshot::Sender<Result<Accepted, StatusCode>>,
+    permit: Permit,
+    intent: Intent,
     received: Instant,
 }
 
@@ -106,6 +113,7 @@ struct Service {
     account: Sequencer,
     journal: Journal,
     settlement: SettlementChecks,
+    progress: watch::Sender<u64>,
 }
 
 pub fn validate_native_schema(path: &std::path::Path) -> anyhow::Result<()> {
@@ -134,7 +142,8 @@ pub async fn run() -> anyhow::Result<()> {
     let schema = std::fs::read_to_string(required("RANDOMNESS_NATIVE_SCHEMA")?)?;
     let l2 = std::env::var("RANDOMNESS_L2_RPC_URL").ok().filter(|url| !url.is_empty());
     let settlement = SettlementChecks::load(&schema, l2.as_deref())?;
-    let mut service = Service { config, account, journal, settlement };
+    let (progress, _) = watch::channel(0);
+    let mut service = Service { config, account, journal, settlement, progress };
     loop {
         match service.recover().await {
             Ok(()) => break,
@@ -147,9 +156,13 @@ pub async fn run() -> anyhow::Result<()> {
     }
     let address: SocketAddr = required("RANDOMNESS_HTTP_BIND")?.parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let (sender, receiver) = mpsc::channel(64);
+    let (sender, receiver) = mpsc::channel(128);
     let state = Arc::new(HttpState {
         admissions: sender,
+        slots: AdmissionSlots::default(),
+        progress: service.progress.clone(),
+        chain,
+        deployment: service.config.deployment,
         journal: Journal::connect(&service.config.primary, &service.config.standby, service.config.epoch).await?,
         provider: JsonRpcClient::new(HttpTransport::new(required("RANDOMNESS_RPC_URL")?.parse::<url::Url>()?)),
     });
@@ -158,9 +171,11 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/key-rotations", post(rotate))
         .route("/actions/:action", get(action_status))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(middleware::from_fn_with_state(Arc::new(Mutex::new(IpLimits::default())), limit_requests))
         .layer(middleware::from_fn(browser_access));
     tokio::select! {
-        result = axum::serve(listener, router) => result.context("admission server"),
+        result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()) => result.context("admission server"),
         result = service.work(receiver) => result,
     }
 }
@@ -179,16 +194,79 @@ async fn browser_access(request: Request, next: Next) -> Response {
     response
 }
 
+async fn limit_requests(
+    State(limits): State<Arc<Mutex<IpLimits>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != Method::OPTIONS
+        && !limits.lock().expect("IP limits poisoned").allow(peer.ip(), Instant::now())
+    {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    next.run(request).await
+}
+
+fn verify_request(action: &ActionRequest, chain: Felt, deployment: Felt) -> Result<Intent, StatusCode> {
+    let intent = Intent::decode(&action.intent).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let digest = intent.identity().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if intent.chain != chain
+        || intent.deployment != deployment
+        || !matches!(starknet_crypto::verify(&action.public_key, &digest, &action.r, &action.s), Ok(true))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(intent)
+}
+
+async fn verify_registered_actor(
+    provider: &JsonRpcClient<HttpTransport>,
+    intent: &Intent,
+    public_key: Felt,
+) -> Result<(), StatusCode> {
+    let fields = provider
+        .call(
+            FunctionCall {
+                contract_address: intent.deployment,
+                entry_point_selector: get_selector_from_name("get_admission").expect("static selector"),
+                calldata: vec![intent.game, intent.actor],
+            },
+            HEAD,
+        )
+        .await
+        .map_err(|error| match error {
+            ProviderError::StarknetError(StarknetError::ContractError(_)) => StatusCode::BAD_REQUEST,
+            error => status_unavailable(error),
+        })?;
+    match fields.as_slice() {
+        [key, _, _, _, _, _, _] if *key == public_key => Ok(()),
+        [_, _, _, _, _, _, _] => Err(StatusCode::BAD_REQUEST),
+        _ => Err(status_unavailable("malformed native admission context")),
+    }
+}
+
 async fn admit(
     State(state): State<Arc<HttpState>>,
     Json(action): Json<ActionRequest>,
 ) -> Result<Json<Accepted>, StatusCode> {
-    let (response, receiver) = oneshot::channel();
-    state
-        .admissions
-        .try_send(Work::Action(AdmissionRequest { action, response, received: Instant::now() }))
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    receiver.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?.map(Json)
+    // Reject invalid signatures before RPC, then bind the key to the actor before
+    // reserving a slot. Execution rechecks the registration after queueing.
+    let intent = verify_request(&action, state.chain, state.deployment)?;
+    verify_registered_actor(&state.provider, &intent, action.public_key).await?;
+    let digest = intent.identity().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let receiver = match state.slots.reserve(intent.actor, digest)? {
+        Slot::Existing(receiver) => receiver,
+        Slot::New(permit) => {
+            let receiver = permit.subscribe();
+            state
+                .admissions
+                .try_send(Work::Action(Box::new(AdmissionRequest { action, permit, intent, received: Instant::now() })))
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            receiver
+        }
+    };
+    crate::admission::decision(receiver).await.map(Json)
 }
 
 async fn rotate(
@@ -208,6 +286,22 @@ async fn action_status(
     Path(action): Path<String>,
 ) -> Result<Json<ActionStatus>, StatusCode> {
     let action = Felt::from_hex(&action).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut progress = state.progress.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let status = retained_status(&state, action).await?;
+        if status.transaction_hash.is_some() {
+            return Ok(Json(status));
+        }
+        match tokio::time::timeout_at(deadline, progress.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => return Ok(Json(status)),
+        }
+    }
+}
+
+async fn retained_status(state: &HttpState, action: Felt) -> Result<ActionStatus, StatusCode> {
     let record = state.journal.find_record(action).await.map_err(status_unavailable)?.ok_or(StatusCode::NOT_FOUND)?;
     let submissions = state.journal.submissions(action).await.map_err(status_unavailable)?;
     // Only the receipt carrying the recorded outcome completes the action. An earlier
@@ -225,7 +319,7 @@ async fn action_status(
             Err(error) => return Err(status_unavailable(error)),
         }
     }
-    Ok(Json(ActionStatus { action, order: record.envelope.order, transaction_hash }))
+    Ok(ActionStatus { action, order: record.envelope.order, transaction_hash })
 }
 
 fn status_unavailable(error: impl std::fmt::Display) -> StatusCode {
@@ -237,7 +331,7 @@ impl Service {
     async fn work(&mut self, mut receiver: mpsc::Receiver<Work>) -> anyhow::Result<()> {
         while let Some(work) = receiver.recv().await {
             let request = match work {
-                Work::Action(request) => request,
+                Work::Action(request) => *request,
                 Work::Rotate { transaction, response } => {
                     let result = self.rotate(*transaction).await?;
                     let _ = response.send(result);
@@ -245,27 +339,25 @@ impl Service {
                 }
             };
             let queue_ms = request.received.elapsed().as_secs_f64() * 1000.0;
-            // Invalid intent never enters the journal. Storage or execution ambiguity stops the worker.
-            let intent = match Intent::decode(&request.action.intent) {
-                Ok(intent) => intent,
-                Err(_) => {
-                    let _ = request.response.send(Err(StatusCode::BAD_REQUEST));
+            let record = match self.accept(request.intent, request.action.r, request.action.s).await {
+                Ok(Ok(record)) => record,
+                Ok(Err(status)) => {
+                    request.permit.resolve(Err(status));
                     continue;
                 }
-            };
-            let record = match self.accept(intent, request.action.r, request.action.s).await? {
-                Ok(record) => record,
-                Err(status) => {
-                    let _ = request.response.send(Err(status));
+                Err(error) if error.downcast_ref::<ProviderError>().is_some() => {
+                    tracing::warn!(target: "sequencer_randomness", %error, "admission RPC unavailable before acceptance");
+                    request.permit.resolve(Err(StatusCode::SERVICE_UNAVAILABLE));
                     continue;
                 }
+                Err(error) => return Err(error),
             };
             tracing::info!(target: "sequencer_randomness", action = %record.envelope.action.to_hex_string(),
                 order = record.envelope.order, queue_ms, admission_ms = request.received.elapsed().as_secs_f64() * 1000.0,
                 "randomness_admission");
-            let _ =
-                request.response.send(Ok(Accepted { action: record.envelope.action, order: record.envelope.order }));
+            request.permit.resolve(Ok(Accepted { action: record.envelope.action, order: record.envelope.order }));
             self.execute(record).await?;
+            self.progress.send_modify(|version| *version = version.wrapping_add(1));
         }
         bail!("admission channel closed")
     }
@@ -698,6 +790,75 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn an_unregistered_key_cannot_reserve_another_players_slot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                assert_eq!(request["method"], "starknet_call");
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": ["0x9", "0x1", "0x1", "0x0", "0x1", "0x0", "0x64"]
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let provider = JsonRpcClient::new(HttpTransport::new(format!("http://{address}").parse::<url::Url>().unwrap()));
+        let intent = Intent {
+            chain: Felt::ONE,
+            deployment: Felt::TWO,
+            game: Felt::ONE,
+            actor: Felt::from(3),
+            nonce: 0,
+            command: Felt::ONE,
+            rules: Felt::ONE,
+            valid_from: 100,
+            valid_until: 200,
+            last_order: 10,
+            arguments: vec![],
+        };
+        assert_eq!(verify_registered_actor(&provider, &intent, Felt::from(8)).await, Err(StatusCode::BAD_REQUEST));
+        assert!(verify_registered_actor(&provider, &intent, Felt::from(9)).await.is_ok());
+        server.abort();
+    }
+
+    #[test]
+    fn request_signature_and_scope_are_checked_before_queueing_or_rpc() {
+        let intent = Intent {
+            chain: Felt::ONE,
+            deployment: Felt::TWO,
+            game: Felt::ONE,
+            actor: Felt::from(3),
+            nonce: 0,
+            command: Felt::ONE,
+            rules: Felt::ONE,
+            valid_from: 100,
+            valid_until: 200,
+            last_order: 10,
+            arguments: vec![],
+        };
+        let key = SigningKey::from_secret_scalar(Felt::from(12345));
+        let signature = key.sign(&intent.identity().unwrap()).unwrap();
+        let mut request = ActionRequest {
+            intent: intent.encode().unwrap(),
+            r: signature.r,
+            s: signature.s,
+            public_key: key.verifying_key().scalar(),
+        };
+        assert!(verify_request(&request, Felt::ONE, Felt::TWO).is_ok());
+        assert!(verify_request(&request, Felt::TWO, Felt::TWO).is_err());
+        assert!(verify_request(&request, Felt::ONE, Felt::ONE).is_err());
+        request.r += Felt::ONE;
+        assert!(verify_request(&request, Felt::ONE, Felt::TWO).is_err());
+        request.r = signature.r;
+        request.intent[6] += Felt::ONE;
+        assert!(verify_request(&request, Felt::ONE, Felt::TWO).is_err());
+    }
+
     #[test]
     fn expired_intent_cannot_use_an_older_closed_block_to_enter() {
         let intent = Intent {
@@ -771,7 +932,7 @@ mod tests {
 
     #[test]
     fn admission_rejects_player_roots_context_and_transport_identity() {
-        let request = serde_json::json!({"intent": [], "r": "0x1", "s": "0x2"});
+        let request = serde_json::json!({"intent": [], "r": "0x1", "s": "0x2", "public_key": "0x3"});
         assert!(serde_json::from_value::<ActionRequest>(request.clone()).is_ok());
         for field in ["root", "context", "request_id", "transaction_hash", "authority_epoch"] {
             let mut altered = request.clone();
