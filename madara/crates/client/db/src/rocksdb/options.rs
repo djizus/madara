@@ -588,7 +588,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("must-not-open");
         let config = RocksDBConfig { write_mode: DbWriteMode { wal: false, fsync: true }, ..Default::default() };
-        let error = RocksDBStorage::open(&path, config).err().expect("invalid durability must be rejected");
+        let Err(error) = RocksDBStorage::open(&path, config) else {
+            panic!("invalid durability must be rejected");
+        };
         assert_eq!(error.to_string(), "Database fsync requires WAL to be enabled");
         assert!(!path.exists(), "invalid configuration must not create the database");
     }
