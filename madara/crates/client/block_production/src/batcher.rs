@@ -106,7 +106,8 @@ impl Batcher {
                                     declared_class,
                                     arrived_at: ts,
                                     from_mempool: false,
-                                    ..Default::default()
+                                    #[cfg(feature = "sequencer-randomness")]
+                                    refusal_reporter: None,
                                 },
                             )
                         })
@@ -121,7 +122,8 @@ impl Batcher {
                         declared_class,
                         arrived_at: TxTimestamp::now(),
                         from_mempool: false,
-                        ..Default::default()
+                        #[cfg(feature = "sequencer-randomness")]
+                        refusal_reporter: None,
                     },
                 )
             })?)
@@ -145,7 +147,8 @@ impl Batcher {
                                             declared_class,
                                             arrived_at: ts,
                                             from_mempool: true,
-                                            ..Default::default()
+                                            #[cfg(feature = "sequencer-randomness")]
+                                            refusal_reporter: None,
                                         },
                                     )
                                 })
