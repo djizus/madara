@@ -525,7 +525,6 @@ pub enum StarknetWsApiError {
     NoBlocks,
     BlockNotFound,
     Pending,
-    SubscriptionClosed,
     Internal,
 }
 
@@ -539,7 +538,6 @@ impl StarknetWsApiError {
             Self::NoBlocks => 32,
             Self::BlockNotFound => 24,
             Self::Pending => 69,
-            Self::SubscriptionClosed => jsonrpsee::types::error::CALL_EXECUTION_FAILED_CODE,
             Self::Internal => jsonrpsee::types::error::INTERNAL_ERROR_CODE,
         }
     }
@@ -553,7 +551,6 @@ impl StarknetWsApiError {
             Self::BlockNotFound => "Block not found",
             // See https://github.com/starkware-libs/starknet-specs/pull/237
             Self::Pending => "The pending block is not supported on this method call",
-            Self::SubscriptionClosed => "Subscription closed",
             Self::Internal => jsonrpsee::types::error::INTERNAL_ERROR_MSG,
         }
     }
@@ -573,7 +570,7 @@ impl From<StarknetWsApiError> for jsonrpsee::types::ErrorObjectOwned {
 
 impl Display for StarknetWsApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "\"code\": {}, \"message\": {}", self.code(), self.message())
+        f.write_str(self.message())
     }
 }
 

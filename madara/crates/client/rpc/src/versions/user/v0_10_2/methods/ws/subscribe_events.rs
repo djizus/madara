@@ -162,7 +162,7 @@ async fn backfill_events(
             return Ok(BackfillResult::Closed);
         }
         if state.ctx.is_cancelled() {
-            return Err(crate::errors::StarknetWsApiError::SubscriptionClosed);
+            return Ok(BackfillResult::Closed);
         }
 
         match state.reorgs.try_recv() {
@@ -182,7 +182,7 @@ async fn backfill_events(
         }
 
         if state.ctx.is_cancelled() {
-            return Err(crate::errors::StarknetWsApiError::SubscriptionClosed);
+            return Ok(BackfillResult::Closed);
         }
         let block_number = *state.next_block_n;
         if let Some(reorg) = send_block_events(starknet, state, block_number, &mut emitted).await? {
@@ -245,7 +245,7 @@ async fn stream_live_events(
                 continue;
             },
             _ = state.sink.closed() => return Ok(LiveResult::Closed),
-            _ = state.ctx.cancelled() => return Err(crate::errors::StarknetWsApiError::SubscriptionClosed),
+            _ = state.ctx.cancelled() => return Ok(LiveResult::Closed),
         };
 
         let block_number = block_view.block_number();
