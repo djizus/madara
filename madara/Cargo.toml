@@ -43,6 +43,7 @@ mp-utils.workspace = true
 
 # Madara client
 mc-block-production.workspace = true
+mc-sequencer-randomness = { workspace = true, optional = true }
 mc-class-exec.workspace = true
 mc-db.workspace = true
 mc-devnet.workspace = true
@@ -169,3 +170,4 @@ zeroize.workspace = true
 
 [features]
 default = []
+sequencer-randomness = ["dep:mc-sequencer-randomness", "mc-block-production/sequencer-randomness"]

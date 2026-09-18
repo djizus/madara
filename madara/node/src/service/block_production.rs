@@ -116,6 +116,12 @@ impl BlockProductionService {
         anyhow::Ok(())
     }
 
+    #[cfg(feature = "sequencer-randomness")]
+    pub fn with_game_observers(mut self, observers: mc_sequencer_randomness::submission::ExecutionObservers) -> Self {
+        self.task.as_mut().expect("service not started").set_game_observers(observers);
+        self
+    }
+
     pub fn handle(&self) -> BlockProductionHandle {
         self.task.as_ref().expect("Service started").handle()
     }

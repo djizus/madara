@@ -454,6 +454,20 @@ async fn main() -> anyhow::Result<()> {
     let validated_tx_submit =
         MakeSubmitValidatedTransactionSwitch::new(Arc::clone(&gateway_client) as _, service_mempool.mempool() as _);
 
+    #[cfg(feature = "sequencer-randomness")]
+    let game_observers = mc_sequencer_randomness::submission::ExecutionObservers::new(
+        starknet_types_core::felt::Felt::from_hex(&mc_sequencer_randomness::service::required("RANDOMNESS_ACCOUNT")?)?,
+    );
+    #[cfg(feature = "sequencer-randomness")]
+    let service_game = mc_sequencer_randomness::service::GameService::from_env(
+        backend.clone(),
+        service_mempool.mempool(),
+        Arc::clone(&mempool_tx_validator) as _,
+        game_observers.clone(),
+    )?;
+    #[cfg(feature = "sequencer-randomness")]
+    let service_block_production = service_block_production.with_game_observers(game_observers);
+
     // User-facing RPC
 
     let service_rpc_user = RpcService::user(
@@ -463,6 +477,9 @@ async fn main() -> anyhow::Result<()> {
         tx_lookup.clone(),
         Some(service_mempool.mempool()),
     );
+
+    #[cfg(feature = "sequencer-randomness")]
+    let service_rpc_user = service_rpc_user.with_game_api(service_game.api());
 
     // Admin-facing RPC (for node operators)
 
@@ -505,6 +522,12 @@ async fn main() -> anyhow::Result<()> {
         .with(service_rpc_user)?
         .with(service_rpc_admin)?
         .with(service_gateway)?;
+
+    #[cfg(feature = "sequencer-randomness")]
+    {
+        app = app.with(service_game)?;
+        app.activate(MadaraServiceId::GameSequencing);
+    }
 
     if let Some(service_external_db) = service_external_db {
         app = app.with(service_external_db)?;

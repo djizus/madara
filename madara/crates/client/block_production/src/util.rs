@@ -119,6 +119,8 @@ impl FromIterator<(Transaction, AdditionalTxInfo)> for BatchToExecute {
 
 #[derive(Debug, Default)]
 pub(crate) struct AdditionalTxInfo {
+    #[cfg(feature = "sequencer-randomness")]
+    pub refusal_reporter: Option<mc_sequencer_randomness::submission::RefusalReporter>,
     pub declared_class: Option<ConvertedClass>,
     /// Earliest known timestamp for this transaction. Used for mempool re-insertion.
     pub arrived_at: TxTimestamp,

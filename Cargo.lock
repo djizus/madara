@@ -8024,7 +8024,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -9375,6 +9375,7 @@ dependencies = [
  "mc-gateway-server",
  "mc-mempool",
  "mc-rpc",
+ "mc-sequencer-randomness",
  "mc-settlement-client",
  "mc-submit-tx",
  "mc-sync",
@@ -9530,6 +9531,7 @@ dependencies = [
  "mc-devnet",
  "mc-exec",
  "mc-mempool",
+ "mc-sequencer-randomness",
  "mc-settlement-client",
  "mc-submit-tx",
  "mc-telemetry",
@@ -9973,6 +9975,40 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mc-sequencer-randomness"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.7.9",
+ "futures",
+ "jsonrpsee",
+ "mc-db",
+ "mc-exec",
+ "mc-mempool",
+ "mc-submit-tx",
+ "mp-convert",
+ "mp-receipt",
+ "mp-rpc",
+ "mp-transactions",
+ "mp-utils",
+ "num-bigint",
+ "rustix 1.1.2",
+ "serde",
+ "serde_json",
+ "starknet-rust-core 0.19.0-rc.2",
+ "starknet-rust-crypto 0.19.0-rc.2",
+ "starknet-rust-providers",
+ "starknet-rust-signers",
+ "starknet-types-core 0.2.4",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -12550,7 +12586,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -12588,7 +12624,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tracing",
  "windows-sys 0.52.0",
 ]

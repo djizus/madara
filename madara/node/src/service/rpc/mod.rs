@@ -1,4 +1,3 @@
-use self::server::rpc_api_build;
 use crate::{
     cli::RpcParams,
     submit_tx::{MakeSubmitTransactionSwitch, MakeTransactionLookupSwitch},
@@ -34,9 +33,17 @@ pub struct RpcService {
     rpc_type: RpcType,
     block_prod_handle: Option<BlockProductionHandle>,
     mempool: Option<Arc<Mempool>>,
+    #[cfg(feature = "sequencer-randomness")]
+    game_api: Option<mc_sequencer_randomness::service::GameApi>,
 }
 
 impl RpcService {
+    #[cfg(feature = "sequencer-randomness")]
+    pub fn with_game_api(mut self, api: mc_sequencer_randomness::service::GameApi) -> Self {
+        self.game_api = Some(api);
+        self
+    }
+
     pub fn user(
         config: RpcParams,
         backend: Arc<MadaraBackend>,
@@ -54,6 +61,8 @@ impl RpcService {
             rpc_type: RpcType::User,
             block_prod_handle: None,
             mempool: None,
+            #[cfg(feature = "sequencer-randomness")]
+            game_api: None,
         }
     }
 
@@ -76,6 +85,8 @@ impl RpcService {
             rpc_type: RpcType::Admin,
             block_prod_handle: Some(block_prod_handle),
             mempool: Some(mempool),
+            #[cfg(feature = "sequencer-randomness")]
+            game_api: None,
         }
     }
 }
@@ -89,6 +100,8 @@ impl Service for RpcService {
         let transaction_lookup_provider = self.transaction_lookup_provider.clone();
         let tx_status_watcher = self.tx_status_watcher.clone();
         let rpc_type = self.rpc_type.clone();
+        #[cfg(feature = "sequencer-randomness")]
+        let game_api = self.game_api.clone();
 
         let (stop_handle, server_handle) = jsonrpsee::server::stop_channel();
 
@@ -146,11 +159,13 @@ impl Service for RpcService {
                         vec![RpcVersion::RPC_VERSION_ADMIN_0_1_0],
                     ),
                 };
-                let methods = rpc_api_build("rpc", api_rpc).into();
+                let methods = api_rpc.into();
 
                 ServerConfig {
                     name,
                     addr,
+                    #[cfg(feature = "sequencer-randomness")]
+                    game_api: game_api.clone(),
                     batch_config: config.batch_config(),
                     max_connections: config.rpc_max_connections,
                     max_payload_in_mib: config.rpc_max_request_size,

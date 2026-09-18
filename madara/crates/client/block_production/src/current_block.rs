@@ -122,6 +122,10 @@ impl CurrentBlockState {
                 }
                 continue;
             }
+            #[cfg(feature = "sequencer-randomness")]
+            if let (Err(error), Some(reporter)) = (&blockifier_exec_result, additional_info.refusal_reporter.take()) {
+                reporter.report(&format!("{error:#}"));
+            }
             if let Some(core_contract_nonce) = blockifier_tx.l1_handler_tx_nonce() {
                 // Even when the l1 handler tx is reverted, we mark the nonce as consumed.
                 self.consumed_core_contract_nonces
@@ -244,7 +248,9 @@ mod tests {
             incoming_tx_nonce: Nonce(Felt::from(incoming_nonce)),
         };
         let batch = BatchExecutionResult {
-            executed_txs: [(tx, AdditionalTxInfo { arrived_at, declared_class, from_mempool })].into_iter().collect(),
+            executed_txs: [(tx, AdditionalTxInfo { arrived_at, declared_class, from_mempool, ..Default::default() })]
+                .into_iter()
+                .collect(),
             blockifier_results: vec![Err(
                 TransactionExecutionError::TransactionPreValidationError(Box::new(error)).into()
             )],

@@ -28,7 +28,7 @@ pub(super) fn make_tx(backend: &MadaraBackend, tx: impl IntoStarknetApiExt) -> (
         .unwrap()
         .into_blockifier_for_sequencing()
         .unwrap();
-    (tx, AdditionalTxInfo { declared_class, arrived_at: ts, from_mempool: false })
+    (tx, AdditionalTxInfo { declared_class, arrived_at: ts, from_mempool: false, ..Default::default() })
 }
 
 fn make_l1_handler_tx(
@@ -51,7 +51,7 @@ fn make_l1_handler_tx(
     )
     .into_blockifier(backend.chain_config().chain_id.to_felt(), StarknetVersion::LATEST)
     .unwrap();
-    (tx, AdditionalTxInfo { declared_class, arrived_at: Default::default(), from_mempool: false })
+    (tx, AdditionalTxInfo { declared_class, arrived_at: Default::default(), from_mempool: false, ..Default::default() })
 }
 
 #[rstest::rstest]
@@ -100,7 +100,7 @@ async fn contiguous_nonce_execution_preserves_successors(#[case] reject: bool) {
         std::iter::from_fn(|| consumer.next_contiguous(300))
             .map(|tx| {
                 let (tx, arrived_at, declared_class) = tx.into_blockifier_for_sequencing().unwrap();
-                (tx, AdditionalTxInfo { arrived_at, declared_class, from_mempool: true })
+                (tx, AdditionalTxInfo { arrived_at, declared_class, from_mempool: true, ..Default::default() })
             })
             .collect::<BatchToExecute>()
     };

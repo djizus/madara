@@ -112,6 +112,8 @@ mod executor;
 mod finalizer;
 mod handle;
 pub mod metrics;
+#[cfg(feature = "sequencer-randomness")]
+mod randomness;
 mod recovery;
 mod task;
 mod util;
@@ -166,6 +168,8 @@ pub(crate) enum TaskState {
 pub struct BlockProductionTask {
     backend: Arc<MadaraBackend>,
     mempool: Arc<Mempool>,
+    #[cfg(feature = "sequencer-randomness")]
+    game_observers: Option<mc_sequencer_randomness::submission::ExecutionObservers>,
     close_queue_capacity: usize,
     current_state: Option<TaskState>,
     metrics: Arc<BlockProductionMetrics>,
@@ -187,6 +191,11 @@ pub struct BlockProductionTask {
 }
 
 impl BlockProductionTask {
+    #[cfg(feature = "sequencer-randomness")]
+    pub fn set_game_observers(&mut self, observers: mc_sequencer_randomness::submission::ExecutionObservers) {
+        self.game_observers = Some(observers);
+    }
+
     /// Creates a new BlockProductionTask.
     ///
     /// # Parameters
@@ -213,6 +222,8 @@ impl BlockProductionTask {
         Self {
             backend: backend.clone(),
             mempool,
+            #[cfg(feature = "sequencer-randomness")]
+            game_observers: None,
             close_queue_capacity: 1,
             current_state: None,
             metrics,

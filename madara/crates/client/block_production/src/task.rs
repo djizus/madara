@@ -144,19 +144,19 @@ impl BlockProductionTask {
     ) -> anyhow::Result<AbortOnDrop<anyhow::Result<()>>> {
         let batch_sender = executor.send_batch.take().context("Channel sender already taken")?;
         let bypass_tx_input = self.bypass_tx_input.take().context("Bypass tx channel already taken")?;
-        Ok(AbortOnDrop::spawn(
-            Batcher::new(
-                Arc::clone(&self.backend),
-                Arc::clone(&self.mempool),
-                Arc::clone(&self.metrics),
-                Arc::clone(&self.l1_client),
-                ctx,
-                batch_sender,
-                bypass_tx_input,
-                self.mempool_intake_rx.clone(),
-            )
-            .run(),
-        ))
+        let batcher = Batcher::new(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.mempool),
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.l1_client),
+            ctx,
+            batch_sender,
+            bypass_tx_input,
+            self.mempool_intake_rx.clone(),
+        );
+        #[cfg(feature = "sequencer-randomness")]
+        let batcher = batcher.with_game_observers(self.game_observers.clone());
+        Ok(AbortOnDrop::spawn(batcher.run()))
     }
 
     /// Waits for executor replies, ordered close completions, and shutdown signals.

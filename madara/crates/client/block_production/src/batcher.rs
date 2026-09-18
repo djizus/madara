@@ -33,6 +33,8 @@ pub struct Batcher {
     bypass_in: mpsc::Receiver<ValidatedTransaction>,
     mempool_intake_rx: watch::Receiver<MempoolIntakeMode>,
     batch_size: usize,
+    #[cfg(feature = "sequencer-randomness")]
+    game_observers: Option<mc_sequencer_randomness::submission::ExecutionObservers>,
 }
 
 enum BatcherStep {
@@ -42,6 +44,15 @@ enum BatcherStep {
 }
 
 impl Batcher {
+    #[cfg(feature = "sequencer-randomness")]
+    pub fn with_game_observers(
+        mut self,
+        observers: Option<mc_sequencer_randomness::submission::ExecutionObservers>,
+    ) -> Self {
+        self.game_observers = observers;
+        self
+    }
+
     /// Wires the three transaction sources into the executor batch output.
     /// The resulting task owns source prioritization and applies channel backpressure.
     #[allow(clippy::too_many_arguments)]
@@ -57,6 +68,8 @@ impl Batcher {
     ) -> Self {
         Self {
             mempool,
+            #[cfg(feature = "sequencer-randomness")]
+            game_observers: None,
             metrics,
             l1_message_stream: l1_client.create_message_to_l2_consumer(),
             ctx,
@@ -87,14 +100,30 @@ impl Batcher {
                 |tx| {
                     tx.into_blockifier_for_sequencing()
                         .map(|(btx, ts, declared_class)| {
-                            (btx, AdditionalTxInfo { declared_class, arrived_at: ts, from_mempool: false })
+                            (
+                                btx,
+                                AdditionalTxInfo {
+                                    declared_class,
+                                    arrived_at: ts,
+                                    from_mempool: false,
+                                    ..Default::default()
+                                },
+                            )
                         })
                         .map_err(anyhow::Error::from)
                 },
             );
         let l1_txs_stream = self.l1_message_stream.as_mut().map(|res| {
             Ok(res?.into_blockifier(chain_id, sn_version).map(|(btx, declared_class)| {
-                (btx, AdditionalTxInfo { declared_class, arrived_at: TxTimestamp::now(), from_mempool: false })
+                (
+                    btx,
+                    AdditionalTxInfo {
+                        declared_class,
+                        arrived_at: TxTimestamp::now(),
+                        from_mempool: false,
+                        ..Default::default()
+                    },
+                )
             })?)
         });
         let mempool = self.mempool.clone();
@@ -110,7 +139,15 @@ impl Batcher {
                         std::iter::from_fn(move || consumer.next_contiguous(max_txs_per_account_per_batch)).map(|tx| {
                             tx.into_blockifier_for_sequencing()
                                 .map(|(btx, ts, declared_class)| {
-                                    (btx, AdditionalTxInfo { declared_class, arrived_at: ts, from_mempool: true })
+                                    (
+                                        btx,
+                                        AdditionalTxInfo {
+                                            declared_class,
+                                            arrived_at: ts,
+                                            from_mempool: true,
+                                            ..Default::default()
+                                        },
+                                    )
                                 })
                                 .map_err(anyhow::Error::from)
                         }),
@@ -155,6 +192,12 @@ impl Batcher {
             match self.next_batch().await? {
                 BatcherStep::Batch(batch) if !batch.is_empty() => {
                     tracing::debug!("Sending batch of {} transactions to the worker thread.", batch.len());
+                    #[cfg(feature = "sequencer-randomness")]
+                    let mut batch = batch;
+                    #[cfg(feature = "sequencer-randomness")]
+                    if let Some(observers) = &self.game_observers {
+                        super::randomness::observe_batch(observers, &mut batch);
+                    }
                     permit.send(batch);
                 }
                 BatcherStep::Batch(_) | BatcherStep::RebuildStreams => continue,
