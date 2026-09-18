@@ -128,7 +128,7 @@ pub use rocksdb::statistics::StatsLevel;
 /// |---------|---------|-------------|---------|---------------------------------------|
 /// | Enabled | Enabled | Slowest     | Highest | Production critical data              |
 /// | Enabled | Disable | Medium      | High    | Production (safe on crash) - **RECOMMENDED** |
-/// | Disable | Enabled | Fast        | Medium  | Testing, can tolerate data loss       |
+/// | Disable | Enabled | Invalid     | None    | Rejected before database opening      |
 /// | Disable | Disable | Fastest     | Lowest  | Devnet, testing                       |
 ///
 /// # Safety Considerations
