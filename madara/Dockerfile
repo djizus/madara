@@ -76,7 +76,7 @@ RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
 # TODO(prakhar,20/12/2025): Find a proper fix for this!
 # Fetch cargo dependencies and extract sequencer requirements.txt
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo fetch && \
+    cargo fetch --locked && \
     echo "Looking for sequencer requirements.txt in cargo git checkouts..." && \
     REQUIREMENTS_FILE=$(find /usr/local/cargo/git/checkouts -path "*sequencer*/scripts/requirements.txt" 2>/dev/null | head -1) && \
     if [ -z "$REQUIREMENTS_FILE" ]; then \
@@ -94,6 +94,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Step 2: Build crate
 FROM base-rust AS builder-rust
 
+ARG CARGO_FEATURES=""
+
 COPY --from=planner /app/recipe.json recipe.json
 COPY --from=planner /app/sequencer-requirements.txt /app/sequencer-requirements.txt
 
@@ -108,7 +110,7 @@ RUN python3.9 -m venv /app/sequencer_venv && \
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry \
     . /app/sequencer_venv/bin/activate && \
-    CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo chef cook --release --recipe-path recipe.json
+    CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo chef cook --release --locked --package madara --bin madara --features "$CARGO_FEATURES" --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY madara madara
@@ -118,7 +120,25 @@ COPY .db-versions.yml .db-versions.yml
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry \
     . /app/sequencer_venv/bin/activate && \
-    CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo build --release --bin madara
+    CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo build --release --locked --package madara --bin madara --features "$CARGO_FEATURES"
+
+# Match the runtime compiler to this node's resolved native engine. Its own locked
+# dependency graph is retained from this build, never read from the release host.
+RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    python3 - <<'PYCOMPILER'
+import json
+from pathlib import Path
+import shutil
+import subprocess
+
+graph = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
+compiler = next(package for package in graph["packages"] if package["name"] == "cairo-native")
+source = Path(compiler["manifest_path"]).parent
+subprocess.run(["cargo", "install", "--locked", "--root", "/native-tools",
+                "--path", str(source / "binaries/starknet-native-compile")], check=True)
+shutil.copyfile(source / "Cargo.lock", "/native-tools/Cargo.lock")
+PYCOMPILER
 
 # Step 3: runner
 FROM debian:bookworm-slim AS runner
@@ -151,6 +171,8 @@ ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib:/lib/x86_64-linux-gnu:/li
 WORKDIR /app
 
 COPY --from=builder-rust /app/target/release/madara /bin
+COPY --from=builder-rust /native-tools/bin/starknet-native-compile /bin
+COPY --from=builder-rust /native-tools/Cargo.lock /usr/share/madara/native-compiler-Cargo.lock
 
 ENV TINI_VERSION=v0.19.0
 ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /bin/tini
