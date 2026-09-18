@@ -1,8 +1,9 @@
 mod admission;
+mod epoch;
 mod execution;
-pub mod journal;
+mod key_rotation;
+mod node;
 pub mod protocol;
-mod rotation;
 pub mod service;
 mod settlement;
 pub mod submission;

@@ -6,7 +6,8 @@ use starknet_types_core::{
 const ACTION_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f414354494f4e");
 const ENVELOPE_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f454e54524f5059");
 const VERSION: Felt = Felt::ONE;
-const MAX_ARGUMENTS: usize = 256;
+pub const ENVELOPE_VERSION: u64 = 3;
+pub(crate) const MAX_ARGUMENTS: usize = 256;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -18,7 +19,7 @@ pub enum ProtocolError {
     Bytes,
 }
 
-/// The signed action excludes transport identifiers and the current authority epoch.
+/// The signed action excludes transport identifiers and the sampled root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub chain: Felt,
@@ -83,59 +84,59 @@ impl Intent {
         Ok(intent)
     }
 
+    pub(crate) fn from_calldata(fields: &[Felt]) -> Result<Self, ProtocolError> {
+        let mut encoded = vec![ACTION_TAG, VERSION];
+        encoded.extend_from_slice(fields);
+        Self::decode(&encoded)
+    }
+
     pub fn identity(&self) -> Result<Felt, ProtocolError> {
         Ok(Poseidon::hash_array(&self.encode()?))
     }
 }
 
-/// Encoding alone does not establish acceptance. Only the journal may release a committed envelope.
+/// An assigned context is volatile until its execution is recorded by the chain.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub action: Felt,
     pub order: u64,
-    pub preceding_state: Felt,
     pub timestamp: u64,
     pub execution_config: Felt,
-    pub l2_gas: u64,
     pub root: [u8; 32],
 }
 
 impl Envelope {
     pub fn encode(&self) -> Result<Vec<Felt>, ProtocolError> {
-        if self.order == 0 || self.l2_gas == 0 {
+        if self.order == 0 {
             return Err(ProtocolError::Envelope);
         }
         let (low, high) = root_limbs(self.root);
         Ok(vec![
             ENVELOPE_TAG,
-            Felt::TWO,
+            ENVELOPE_VERSION.into(),
             self.action,
             self.order.into(),
-            self.preceding_state,
             self.timestamp.into(),
             self.execution_config,
-            self.l2_gas.into(),
             low.into(),
             high.into(),
         ])
     }
 
     pub fn decode(fields: &[Felt]) -> Result<Self, ProtocolError> {
-        if fields.len() != 10 || fields[0] != ENVELOPE_TAG || fields[1] != Felt::TWO {
+        if fields.len() != 8 || fields[0] != ENVELOPE_TAG || fields[1] != Felt::from(ENVELOPE_VERSION) {
             return Err(ProtocolError::Envelope);
         }
-        let low: u128 = fields[8].try_into().map_err(|_| ProtocolError::Envelope)?;
-        let high: u128 = fields[9].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let low: u128 = fields[6].try_into().map_err(|_| ProtocolError::Envelope)?;
+        let high: u128 = fields[7].try_into().map_err(|_| ProtocolError::Envelope)?;
         let mut root = [0; 32];
         root[..16].copy_from_slice(&high.to_be_bytes());
         root[16..].copy_from_slice(&low.to_be_bytes());
         let envelope = Self {
             action: fields[2],
             order: fields[3].try_into().map_err(|_| ProtocolError::Envelope)?,
-            preceding_state: fields[4],
-            timestamp: fields[5].try_into().map_err(|_| ProtocolError::Envelope)?,
-            execution_config: fields[6],
-            l2_gas: fields[7].try_into().map_err(|_| ProtocolError::Envelope)?,
+            timestamp: fields[4].try_into().map_err(|_| ProtocolError::Envelope)?,
+            execution_config: fields[5],
             root,
         };
         envelope.encode()?;

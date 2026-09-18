@@ -222,6 +222,7 @@ pub struct Mempool<D: MadaraStorageRead = RocksDBStorage> {
     metrics: MempoolMetrics,
     external_db_outbox_metrics: ExternalDbOutboxMetrics,
     config: MempoolConfig,
+    loaded: tokio::sync::watch::Sender<bool>,
     external_outbox: ExternalOutboxConfig,
     ttl: Option<Duration>,
     /// Pubsub for transaction statuses.
@@ -241,6 +242,7 @@ impl<D: MadaraStorageRead> Mempool<D> {
             backend,
             external_outbox: config.external_outbox,
             config,
+            loaded: tokio::sync::watch::channel(false).0,
             metrics: MempoolMetrics::register(),
             external_db_outbox_metrics: ExternalDbOutboxMetrics::register(),
             watch_transaction_status: Default::default(),
@@ -414,7 +416,9 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
     }
 
     pub async fn run_mempool_task(&self, ctx: ServiceContext) -> anyhow::Result<()> {
+        self.loaded.send_replace(false);
         self.load_txs_from_db().await.context("Loading transactions from db on mempool startup.")?;
+        self.loaded.send_replace(true);
 
         tokio::try_join!(self.run_ttl_task(ctx.clone()), self.run_chain_watcher_task(ctx))?;
         Ok(())
@@ -435,6 +439,12 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
                 _ = interval.tick() => self.remove_ttl_exceeded_txs().await.context("Removing TTL-exceeded txs.")?,
             }
         }
+    }
+
+    /// Consumers assigning account nonces must observe restored transactions first.
+    pub async fn wait_until_loaded(&self) -> anyhow::Result<()> {
+        self.loaded.subscribe().wait_for(|loaded| *loaded).await?;
+        Ok(())
     }
 
     pub async fn is_empty(&self) -> bool {

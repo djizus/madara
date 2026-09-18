@@ -1,16 +1,30 @@
-use crate::service::Accepted;
-use axum::http::StatusCode;
+use crate::ticket::ActionStatus;
 use starknet_core::types::Felt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
-type Decision = Option<Result<Accepted, StatusCode>>;
-type Players = Arc<Mutex<HashMap<Felt, Pending>>>;
+type Decision = ActionStatus;
+type Players = Arc<Mutex<Admissions>>;
+#[derive(Default)]
+struct Admissions {
+    pending: HashMap<Felt, Pending>,
+    rotations: HashSet<Felt>,
+}
+
+pub(crate) struct RotationPermit {
+    players: Players,
+    actor: Felt,
+}
+impl Drop for RotationPermit {
+    fn drop(&mut self) {
+        self.players.lock().expect("admission slots poisoned").rotations.remove(&self.actor);
+    }
+}
 
 struct Pending {
     action: Felt,
@@ -32,17 +46,39 @@ pub(crate) struct Permit {
 }
 
 impl AdmissionSlots {
-    pub fn reserve(&self, actor: Felt, action: Felt) -> Result<Slot, StatusCode> {
+    pub async fn rotation(&self, actor: Felt) -> anyhow::Result<RotationPermit> {
+        let (permit, pending) = {
+            let mut state = self.0.lock().expect("admission slots poisoned");
+            anyhow::ensure!(state.rotations.insert(actor), "gameplay key rotation already pending");
+            (
+                RotationPermit { players: self.0.clone(), actor },
+                state.pending.get(&actor).map(|ticket| ticket.decision.subscribe()),
+            )
+        };
+        if let Some(mut pending) = pending {
+            while !pending.borrow_and_update().is_final() {
+                if pending.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        Ok(permit)
+    }
+
+    pub fn reserve(&self, actor: Felt, action: Felt) -> Result<Slot, String> {
         let mut players = self.0.lock().expect("admission slots poisoned");
-        if let Some(pending) = players.get(&actor) {
+        if players.rotations.contains(&actor) {
+            return Err("gameplay key rotation pending".into());
+        }
+        if let Some(pending) = players.pending.get(&actor) {
             return if pending.action == action {
                 Ok(Slot::Existing(pending.decision.subscribe()))
             } else {
-                Err(StatusCode::CONFLICT)
+                Err("player already has a pending action".into())
             };
         }
-        let (decision, _) = watch::channel(None);
-        players.insert(actor, Pending { action, decision: decision.clone() });
+        let (decision, _) = watch::channel(ActionStatus::Queued { action });
+        players.pending.insert(actor, Pending { action, decision: decision.clone() });
         Ok(Slot::New(Permit { players: self.0.clone(), actor, decision }))
     }
 }
@@ -51,23 +87,14 @@ impl Permit {
     pub fn subscribe(&self) -> watch::Receiver<Decision> {
         self.decision.subscribe()
     }
-    pub fn resolve(&self, decision: Result<Accepted, StatusCode>) {
-        self.decision.send_replace(Some(decision));
+    pub fn resolve(&self, decision: ActionStatus) {
+        self.decision.send_replace(decision);
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.players.lock().expect("admission slots poisoned").remove(&self.actor);
-    }
-}
-
-pub(crate) async fn decision(mut receiver: watch::Receiver<Decision>) -> Result<Accepted, StatusCode> {
-    loop {
-        if let Some(result) = receiver.borrow_and_update().clone() {
-            return result;
-        }
-        receiver.changed().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        self.players.lock().expect("admission slots poisoned").pending.remove(&self.actor);
     }
 }
 
@@ -103,36 +130,58 @@ impl IpLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
-    async fn a_flooding_player_uses_one_slot_and_duplicates_follow_the_same_admission() {
+    async fn rotation_waits_for_its_player_but_cannot_block_other_players() {
+        let slots = AdmissionSlots::default();
+        let Slot::New(ticket) = slots.reserve(Felt::ONE, Felt::from(10)).unwrap() else { panic!("new actor") };
+        let rotation = slots.rotation(Felt::ONE);
+        tokio::pin!(rotation);
+        assert!(futures::poll!(&mut rotation).is_pending());
+        assert!(slots.reserve(Felt::ONE, Felt::from(11)).is_err());
+        let Slot::New(other) = slots.reserve(Felt::TWO, Felt::from(12)).unwrap() else {
+            panic!("unrelated actor blocked")
+        };
+        ticket.resolve(ActionStatus::Recorded {
+            action: Felt::from(10),
+            order: 1,
+            transaction_hash: Felt::ONE,
+            succeeded: true,
+            reason: Felt::ZERO,
+            nonce_consumed: true,
+        });
+        let permit = rotation.await.unwrap();
+        drop(ticket);
+        assert!(slots.reserve(Felt::ONE, Felt::from(11)).is_err());
+        drop(permit); // A refused rotation also releases only this actor.
+        assert!(matches!(slots.reserve(Felt::ONE, Felt::from(11)), Ok(Slot::New(_))));
+        drop(other);
+    }
+    #[test]
+    fn a_flooding_actor_uses_one_slot_and_duplicates_observe_the_same_ticket() {
         let slots = AdmissionSlots::default();
         let Slot::New(first) = slots.reserve(Felt::ONE, Felt::from(10)).unwrap() else { panic!("new actor") };
         for _ in 0..1000 {
-            assert!(matches!(slots.reserve(Felt::ONE, Felt::from(11)), Err(StatusCode::CONFLICT)));
+            assert!(slots.reserve(Felt::ONE, Felt::from(11)).is_err());
         }
         let Slot::Existing(duplicate) = slots.reserve(Felt::ONE, Felt::from(10)).unwrap() else { panic!("duplicate") };
         let Slot::New(other) = slots.reserve(Felt::TWO, Felt::from(12)).unwrap() else {
             panic!("other player blocked")
         };
-        first.resolve(Ok(Accepted { action: Felt::from(10), order: 1 }));
-        assert_eq!(decision(duplicate).await.unwrap().order, 1);
-        assert!(matches!(slots.reserve(Felt::ONE, Felt::from(11)), Err(StatusCode::CONFLICT)));
+        first.resolve(ActionStatus::Accepted { action: Felt::from(10), order: 1 });
+        assert_eq!(*duplicate.borrow(), ActionStatus::Accepted { action: Felt::from(10), order: 1 });
         drop(first);
         assert!(matches!(slots.reserve(Felt::ONE, Felt::from(11)), Ok(Slot::New(_))));
         drop(other);
     }
-
     #[tokio::test]
-    async fn a_failed_queue_send_releases_the_actor_and_wakes_duplicate_waiters() {
+    async fn failed_queue_send_releases_the_actor_and_wakes_waiters() {
         let slots = AdmissionSlots::default();
         let Slot::New(permit) = slots.reserve(Felt::ONE, Felt::TWO).unwrap() else { panic!("new actor") };
-        let waiting = permit.subscribe();
+        let mut waiting = permit.subscribe();
         drop(permit);
-        assert!(matches!(decision(waiting).await, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(waiting.changed().await.is_err());
         assert!(matches!(slots.reserve(Felt::ONE, Felt::from(3)), Ok(Slot::New(_))));
     }
-
     #[test]
     fn ip_limits_bound_abuse_without_sharing_a_budget_between_addresses() {
         let mut limits = IpLimits::default();

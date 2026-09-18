@@ -336,6 +336,8 @@ pub struct BlockProductionTask {
     bypass_tx_input: Option<mpsc::Receiver<ValidatedTransaction>>,
     no_charge_fee: bool,
     discard_preconfirmed_on_startup: bool,
+    #[cfg(feature = "sequencer-randomness")]
+    game_observers: Option<mc_sequencer_randomness::submission::ExecutionObservers>,
 }
 
 impl BlockProductionTask {
@@ -370,7 +372,14 @@ impl BlockProductionTask {
             bypass_tx_input: Some(bypass_tx_input),
             no_charge_fee,
             discard_preconfirmed_on_startup,
+            #[cfg(feature = "sequencer-randomness")]
+            game_observers: None,
         }
+    }
+
+    #[cfg(feature = "sequencer-randomness")]
+    pub fn set_game_observers(&mut self, observers: mc_sequencer_randomness::submission::ExecutionObservers) {
+        self.game_observers = Some(observers);
     }
 
     pub fn handle(&self) -> BlockProductionHandle {
@@ -1057,6 +1066,8 @@ impl BlockProductionTask {
                 ctx,
                 batch_sender,
                 bypass_tx_input,
+                #[cfg(feature = "sequencer-randomness")]
+                self.game_observers.clone(),
             )
             .run(),
         );

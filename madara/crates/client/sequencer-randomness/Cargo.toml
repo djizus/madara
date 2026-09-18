@@ -9,11 +9,21 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+futures.workspace = true
+jsonrpsee.workspace = true
+mc-db.workspace = true
+mc-exec.workspace = true
+mc-mempool.workspace = true
+mc-submit-tx.workspace = true
+mp-convert.workspace = true
+mp-receipt.workspace = true
+mp-rpc.workspace = true
+mp-transactions.workspace = true
+mp-utils.workspace = true
 anyhow = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-starknet-accounts = { workspace = true }
 starknet-providers = { workspace = true }
 starknet-signers = { workspace = true }
 rustix = { version = "=1.1.2", features = ["rand"] }
@@ -22,10 +32,10 @@ starknet-types-core = { workspace = true }
 starknet-crypto = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tokio-postgres = "=0.7.13"
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["json"] }
 url = { workspace = true }
 
 [dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
 num-bigint = { workspace = true }

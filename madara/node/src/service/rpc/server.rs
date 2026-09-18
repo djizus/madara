@@ -25,6 +25,8 @@ const WS_MAX_PING_FAILURES: usize = 3;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub name: String,
+    #[cfg(feature = "sequencer-randomness")]
+    pub game_api: Option<mc_sequencer_randomness::service::GameApi>,
     pub addr: SocketAddr,
     pub cors: Option<Vec<String>>,
     pub rpc_version_default: mp_chain_config::RpcVersion,
@@ -60,6 +62,8 @@ pub async fn start_server(
 ) -> anyhow::Result<()> {
     let ServerConfig {
         name,
+        #[cfg(feature = "sequencer-randomness")]
+        game_api,
         addr,
         cors,
         rpc_version_default,
@@ -108,8 +112,21 @@ pub async fn start_server(
     };
     let ctx1 = ctx.clone();
 
-    let make_service = hyper::service::make_service_fn(move |_| {
+    let make_service = hyper::service::make_service_fn(move |_connection: &hyper::server::conn::AddrStream| {
         let cfg = cfg.clone();
+        let cfg = {
+            let mut cfg = cfg;
+            let mut methods = jsonrpsee::RpcModule::new(());
+            methods.merge(cfg.methods).expect("valid node methods");
+            #[cfg(feature = "sequencer-randomness")]
+            if let Some(api) = &game_api {
+                methods
+                    .merge(api.rpc(_connection.remote_addr().ip()).expect("valid game subscription methods"))
+                    .expect("game methods have a unique namespace");
+            }
+            cfg.methods = rpc_api_build("rpc", methods).into();
+            cfg
+        };
         let ctx1 = ctx1.clone();
         let starknet = Arc::clone(&starknet);
 

@@ -1,394 +1,143 @@
 use crate::protocol::{Envelope, Intent, ProtocolError};
+use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    Proposed,
-    Committed,
-    Submitted,
-    Executed,
-    TerminalRejected,
-    Consumed,
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionRequest {
+    pub intent: Vec<Felt>,
+    pub public_key: Felt,
+    pub r: Felt,
+    pub s: Felt,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TicketError {
-    #[error(transparent)]
-    Protocol(#[from] ProtocolError),
-    #[error("acceptance context is outside signed limits")]
-    Context,
-    #[error("entropy sampling was already attempted")]
-    AlreadySampled,
-    #[error("initialized operating-system entropy source failed")]
-    Entropy,
-    #[error("ticket has not committed")]
-    Uncommitted,
-    #[error("invalid ticket transition")]
-    Transition,
-    #[error("conflicting result")]
-    ConflictingResult,
-}
-
-/// No root is present in a proposal's execution context.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Context {
-    pub order: u64,
-    pub preceding_state: Felt,
-    pub timestamp: u64,
-    pub execution_config: Felt,
-    pub l2_gas: u64,
-}
-
-impl Context {
-    pub fn validate(&self, intent: &Intent) -> Result<(), TicketError> {
-        intent.encode()?;
-        if self.order == 0
-            || self.order > intent.last_order
-            || self.timestamp < intent.valid_from
-            || self.timestamp > intent.valid_until
-            || self.l2_gas == 0
-        {
-            return Err(TicketError::Context);
-        }
-        Ok(())
+impl ActionRequest {
+    /// Signature and scope are checked before acquiring an actor slot or reading node state.
+    pub fn verify(&self, chain: Felt, deployment: Felt) -> anyhow::Result<Intent> {
+        let intent = Intent::decode(&self.intent)?;
+        anyhow::ensure!(intent.chain == chain && intent.deployment == deployment, "wrong signing domain");
+        anyhow::ensure!(
+            matches!(starknet_crypto::verify(&self.public_key, &intent.identity()?, &self.r, &self.s), Ok(true)),
+            "invalid player signature"
+        );
+        Ok(intent)
     }
 }
 
-pub fn timestamp_in_bounds(recorded: u64, block_time: u64) -> bool {
-    recorded <= block_time
+#[derive(Clone)]
+pub(crate) struct RecordedTicket {
+    pub intent: Intent,
+    pub envelope: Envelope,
+    pub r: Felt,
+    pub s: Felt,
 }
 
-/// The journal must persist exclusive sampling ownership before invoking `sample_os`.
-/// This value is deliberately neither Clone nor Debug: a proposal cannot become a second sampler or a log record.
-pub struct Ticket {
-    intent: Intent,
-    context: Context,
-    state: State,
-    sampling_attempted: bool,
-    envelope: Option<Envelope>,
-    submissions: Vec<Felt>,
-    result: Option<Felt>,
+impl RecordedTicket {
+    pub fn take_calldata(fields: &mut &[Felt]) -> anyhow::Result<Self> {
+        let arguments: usize = (*fields.get(10).ok_or_else(|| anyhow::anyhow!("truncated intent"))?).try_into()?;
+        anyhow::ensure!(arguments <= crate::protocol::MAX_ARGUMENTS, "too many intent arguments");
+        let intent_len = 11 + arguments;
+        let envelope_len: usize =
+            (*fields.get(intent_len).ok_or_else(|| anyhow::anyhow!("truncated context"))?).try_into()?;
+        anyhow::ensure!(envelope_len == 8, "invalid context length");
+        let total = intent_len + 1 + envelope_len + 2;
+        anyhow::ensure!(fields.len() >= total, "truncated recorded action");
+        let intent = Intent::from_calldata(&fields[..intent_len])?;
+        let envelope = Envelope::decode(&fields[intent_len + 1..total - 2])?;
+        anyhow::ensure!(envelope.action == intent.identity()?, "recorded action commitment mismatch");
+        let result = Self { intent, envelope, r: fields[total - 2], s: fields[total - 1] };
+        *fields = &fields[total..];
+        Ok(result)
+    }
+
+    pub fn calldata(&self) -> Result<Vec<Felt>, ProtocolError> {
+        let mut payload = self.intent.encode()?[2..].to_vec();
+        let envelope = self.envelope.encode()?;
+        payload.push(Felt::from(envelope.len() as u64));
+        payload.extend(envelope);
+        payload.extend([self.r, self.s]);
+        Ok(payload)
+    }
 }
 
-impl Ticket {
-    pub(crate) fn restore(
-        intent: Intent,
-        envelope: Envelope,
-        state: State,
-        result: Option<Felt>,
-    ) -> Result<Self, TicketError> {
-        if state == State::Proposed
-            || matches!(state, State::Executed | State::TerminalRejected | State::Consumed) != result.is_some()
-            || envelope.action != intent.identity()?
-        {
-            return Err(TicketError::Transition);
-        }
-        let context = Context {
-            order: envelope.order,
-            preceding_state: envelope.preceding_state,
-            timestamp: envelope.timestamp,
-            execution_config: envelope.execution_config,
-            l2_gas: envelope.l2_gas,
-        };
-        context.validate(&intent)?;
-        Ok(Self {
-            intent,
-            context,
-            state,
-            sampling_attempted: true,
-            envelope: Some(envelope),
-            submissions: Vec::new(),
-            result,
-        })
-    }
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ActionStatus {
+    Queued { action: Felt },
+    Accepted { action: Felt, order: u64 },
+    Submitted { action: Felt, order: u64, transaction_hash: Felt },
+    Recorded { action: Felt, order: u64, transaction_hash: Felt, succeeded: bool, reason: Felt, nonce_consumed: bool },
+    Refused { action: Felt, reason: String },
+}
 
-    pub fn propose(intent: Intent, context: Context) -> Result<Self, TicketError> {
-        context.validate(&intent)?;
-        Ok(Self {
-            intent,
-            context,
-            state: State::Proposed,
-            sampling_attempted: false,
-            envelope: None,
-            submissions: Vec::new(),
-            result: None,
-        })
+impl ActionStatus {
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Recorded { .. } | Self::Refused { .. })
     }
+}
 
-    pub fn sample_os(&mut self) -> Result<(), TicketError> {
-        self.sample_with(|root| {
-            let read = rustix::rand::getrandom(&mut root[..], rustix::rand::GetRandomFlags::empty())
-                .map_err(|_| TicketError::Entropy)?;
-            if read != root.len() {
-                return Err(TicketError::Entropy);
-            }
-            Ok(())
-        })
-    }
-
-    fn sample_with(&mut self, fill: impl FnOnce(&mut [u8; 32]) -> Result<(), TicketError>) -> Result<(), TicketError> {
-        if self.sampling_attempted {
-            return Err(TicketError::AlreadySampled);
-        }
-        if self.state != State::Proposed {
-            return Err(TicketError::Transition);
-        }
-        // Set before calling the source, including on error or unwind. The durable claim survives process loss.
-        self.sampling_attempted = true;
-        let mut root = [0; 32];
-        fill(&mut root)?;
-        self.envelope = Some(Envelope {
-            action: self.intent.identity()?,
-            order: self.context.order,
-            preceding_state: self.context.preceding_state,
-            timestamp: self.context.timestamp,
-            execution_config: self.context.execution_config,
-            l2_gas: self.context.l2_gas,
-            root,
-        });
-        Ok(())
-    }
-
-    /// Called only after the journal acknowledges durable replication of this exact envelope.
-    pub fn committed(&mut self) -> Result<(), TicketError> {
-        if self.state != State::Proposed || self.envelope.is_none() {
-            return Err(TicketError::Transition);
-        }
-        self.state = State::Committed;
-        Ok(())
-    }
-
-    pub(crate) fn envelope_for_journal(&self) -> Result<&Envelope, TicketError> {
-        self.envelope.as_ref().ok_or(TicketError::Uncommitted)
-    }
-
-    pub fn envelope(&self) -> Result<&Envelope, TicketError> {
-        if self.state == State::Proposed {
-            return Err(TicketError::Uncommitted);
-        }
-        self.envelope.as_ref().ok_or(TicketError::Uncommitted)
-    }
-
-    pub fn submitted(&mut self, transaction: Felt) -> Result<(), TicketError> {
-        if !matches!(self.state, State::Committed | State::Submitted) || transaction == Felt::ZERO {
-            return Err(TicketError::Transition);
-        }
-        if !self.submissions.contains(&transaction) {
-            self.submissions.push(transaction);
-        }
-        self.state = State::Submitted;
-        Ok(())
-    }
-
-    pub fn finish(&mut self, outcome: State, result: Felt) -> Result<(), TicketError> {
-        if !matches!(outcome, State::Executed | State::TerminalRejected) || result == Felt::ZERO {
-            return Err(TicketError::Transition);
-        }
-        if self.state == outcome {
-            return if self.result == Some(result) { Ok(()) } else { Err(TicketError::ConflictingResult) };
-        }
-        if self.state != State::Submitted {
-            return Err(TicketError::Transition);
-        }
-        self.result = Some(result);
-        self.state = outcome;
-        Ok(())
-    }
-
-    pub fn consume(&mut self) -> Result<(), TicketError> {
-        if !matches!(self.state, State::Executed | State::TerminalRejected | State::Consumed) {
-            return Err(TicketError::Transition);
-        }
-        self.state = State::Consumed;
-        Ok(())
-    }
+pub(crate) fn context_matches(intent: &Intent, order: u64, timestamp: u64) -> bool {
+    order > 0 && order <= intent.last_order && (intent.valid_from..=intent.valid_until).contains(&timestamp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn proposal() -> Ticket {
-        Ticket::propose(
-            Intent {
-                chain: Felt::ONE,
-                deployment: Felt::TWO,
-                game: Felt::THREE,
-                actor: Felt::ONE,
-                nonce: 0,
-                command: Felt::ONE,
-                rules: Felt::ONE,
-                valid_from: 1000,
-                valid_until: 1010,
-                last_order: 10,
-                arguments: vec![],
-            },
-            Context {
-                order: 1,
-                preceding_state: Felt::ZERO,
-                timestamp: 1005,
-                execution_config: Felt::ONE,
-                l2_gas: 1_200_000_000,
-            },
-        )
-        .unwrap()
-    }
-
-    fn sampled() -> Ticket {
-        let mut ticket = proposal();
-        ticket
-            .sample_with(|root| {
-                *root = [255; 32];
-                Ok(())
-            })
-            .unwrap();
-        ticket
-    }
+    use starknet_signers::SigningKey;
 
     #[test]
-    fn root_is_hidden_until_commit_and_preserved_through_both_terminal_paths() {
-        for outcome in [State::Executed, State::TerminalRejected] {
-            let mut ticket = sampled();
-            assert!(matches!(ticket.envelope(), Err(TicketError::Uncommitted)));
-            ticket.committed().unwrap();
-            let binding = ticket.envelope().unwrap().binding().unwrap();
-            assert_eq!(ticket.envelope().unwrap().root, [255; 32]);
-            for transaction in [Felt::ONE, Felt::ONE, Felt::TWO] {
-                ticket.submitted(transaction).unwrap();
-            }
-            assert_eq!(ticket.submissions, vec![Felt::ONE, Felt::TWO]);
-            ticket.finish(outcome, Felt::THREE).unwrap();
-            ticket.finish(outcome, Felt::THREE).unwrap();
-            assert_eq!(ticket.finish(outcome, Felt::ONE), Err(TicketError::ConflictingResult));
-            ticket.consume().unwrap();
-            ticket.consume().unwrap();
-            assert_eq!(ticket.state, State::Consumed);
-            assert_eq!(ticket.envelope().unwrap().binding().unwrap(), binding);
-            assert_eq!(ticket.sample_os(), Err(TicketError::AlreadySampled));
-        }
-    }
-
-    #[test]
-    fn recovery_at_every_accepted_state_keeps_the_binding_and_cannot_sample() {
-        let original = sampled();
-        let envelope = original.envelope_for_journal().unwrap().clone();
-        for state in [State::Committed, State::Submitted, State::Executed, State::TerminalRejected, State::Consumed] {
-            let result =
-                matches!(state, State::Executed | State::TerminalRejected | State::Consumed).then_some(Felt::THREE);
-            let mut recovered = Ticket::restore(original.intent.clone(), envelope.clone(), state, result).unwrap();
-            assert_eq!(recovered.state, state);
-            assert!(recovered.envelope().unwrap() == &envelope);
-            assert_eq!(
-                recovered.sample_with(|_| panic!("recovery invoked the entropy source")),
-                Err(TicketError::AlreadySampled)
-            );
-            assert_eq!(recovered.envelope().unwrap().binding(), envelope.binding());
-        }
-        assert!(matches!(
-            Ticket::restore(original.intent, envelope, State::Proposed, None),
-            Err(TicketError::Transition)
-        ));
-    }
-
-    #[test]
-    fn entropy_error_or_partial_fill_never_allows_a_second_attempt() {
-        let mut ticket = proposal();
-        assert_eq!(
-            ticket.sample_with(|root| {
-                root[0] = 1;
-                Err(TicketError::Entropy)
-            }),
-            Err(TicketError::Entropy)
-        );
-        assert_eq!(ticket.sample_with(|_| panic!("second source call")), Err(TicketError::AlreadySampled));
-        assert_eq!(ticket.committed(), Err(TicketError::Transition));
-        assert!(matches!(ticket.envelope(), Err(TicketError::Uncommitted)));
-    }
-
-    #[test]
-    fn source_unwind_and_zero_transaction_or_result_fail_closed() {
-        let mut ticket = proposal();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = ticket.sample_with(|_| panic!("source interrupted"));
-        }));
-        assert!(panic.is_err());
-        assert_eq!(ticket.sample_os(), Err(TicketError::AlreadySampled));
-        let mut ticket = sampled();
-        ticket.committed().unwrap();
-        assert_eq!(ticket.submitted(Felt::ZERO), Err(TicketError::Transition));
-        ticket.submitted(Felt::ONE).unwrap();
-        assert_eq!(ticket.finish(State::Executed, Felt::ZERO), Err(TicketError::Transition));
-        assert_eq!(ticket.finish(State::TerminalRejected, Felt::ZERO), Err(TicketError::Transition));
-        ticket.finish(State::Executed, Felt::ONE).unwrap();
-        assert_eq!(ticket.finish(State::TerminalRejected, Felt::ONE), Err(TicketError::Transition));
-    }
-
-    #[test]
-    fn initialized_os_source_fills_a_complete_root() {
-        let mut ticket = proposal();
-        ticket.sample_os().unwrap();
-        ticket.committed().unwrap();
-        assert_eq!(ticket.envelope().unwrap().root.len(), 32);
-        assert_eq!(ticket.sample_os(), Err(TicketError::AlreadySampled));
-    }
-
-    #[test]
-    #[ignore = "requires getrandom denied by the syscall fault drill"]
-    fn syscall_failure_has_no_fallback() {
-        let mut ticket = proposal();
-        assert_eq!(ticket.sample_os(), Err(TicketError::Entropy));
-        assert_eq!(ticket.sample_os(), Err(TicketError::AlreadySampled));
-        assert!(matches!(ticket.envelope(), Err(TicketError::Uncommitted)));
+    fn verifies_every_request_before_admission() {
+        let key = SigningKey::from_secret_scalar(Felt::from(123));
+        let intent = Intent {
+            chain: Felt::ONE,
+            deployment: Felt::TWO,
+            game: Felt::ONE,
+            actor: Felt::from(99),
+            nonce: 0,
+            command: Felt::ONE,
+            rules: Felt::ONE,
+            valid_from: 10,
+            valid_until: 20,
+            last_order: 5,
+            arguments: vec![],
+        };
+        let signature = key.sign(&intent.identity().unwrap()).unwrap();
+        let mut request = ActionRequest {
+            intent: intent.encode().unwrap(),
+            public_key: key.verifying_key().scalar(),
+            r: signature.r,
+            s: signature.s,
+        };
+        assert_eq!(request.verify(Felt::ONE, Felt::TWO).unwrap(), intent);
+        assert!(request.verify(Felt::TWO, Felt::TWO).is_err());
+        assert!(request.verify(Felt::ONE, Felt::ONE).is_err());
+        request.r += Felt::ONE;
+        assert!(request.verify(Felt::ONE, Felt::TWO).is_err());
     }
 
     #[test]
     fn cross_language_context_boundaries() {
-        let values: Vec<u64> = include_str!("../tests/fixtures/context-v1.txt")
+        let values: Vec<u64> = include_str!("../tests/fixtures/context-v2.txt")
             .lines()
             .map(|line| u64::from_str_radix(line.trim_start_matches("0x"), 16).unwrap())
             .collect();
-        assert_eq!(values.len(), 1 + values[0] as usize * 9);
-        for vector in values[1..].chunks_exact(9) {
-            let mut ticket = proposal();
-            ticket.context.timestamp = vector[0];
-            ticket.intent.valid_from = vector[2];
-            ticket.intent.valid_until = vector[3];
-            ticket.context.order = vector[4];
-            ticket.intent.last_order = vector[5];
-            ticket.context.l2_gas = vector[6];
-            assert_eq!(ticket.context.validate(&ticket.intent).is_ok(), vector[7] == 1);
-            assert_eq!(timestamp_in_bounds(vector[0], vector[1]), vector[8] == 1);
-        }
-    }
-
-    #[test]
-    fn every_invalid_transition_is_rejected() {
-        for state in [
-            State::Proposed,
-            State::Committed,
-            State::Submitted,
-            State::Executed,
-            State::TerminalRejected,
-            State::Consumed,
-        ] {
-            let mut ticket = sampled();
-            ticket.state = state;
-            if state != State::Proposed {
-                assert_eq!(ticket.committed(), Err(TicketError::Transition));
-            }
-            if !matches!(state, State::Committed | State::Submitted) {
-                assert_eq!(ticket.submitted(Felt::ONE), Err(TicketError::Transition));
-            }
-            for outcome in [State::Proposed, State::Committed, State::Submitted, State::Consumed] {
-                assert_eq!(ticket.finish(outcome, Felt::ONE), Err(TicketError::Transition));
-            }
-            if matches!(state, State::Proposed | State::Committed | State::Consumed) {
-                assert_eq!(ticket.finish(State::Executed, Felt::ONE), Err(TicketError::Transition));
-                assert_eq!(ticket.finish(State::TerminalRejected, Felt::ONE), Err(TicketError::Transition));
-            }
-            if matches!(state, State::Proposed | State::Committed | State::Submitted) {
-                assert_eq!(ticket.consume(), Err(TicketError::Transition));
-            }
+        assert_eq!(values.len(), 1 + values[0] as usize * 8);
+        for vector in values[1..].chunks_exact(8) {
+            let intent = Intent {
+                chain: Felt::ONE,
+                deployment: Felt::ONE,
+                game: Felt::ONE,
+                actor: Felt::ONE,
+                nonce: 0,
+                command: Felt::ONE,
+                rules: Felt::ONE,
+                valid_from: vector[2],
+                valid_until: vector[3],
+                last_order: vector[5],
+                arguments: vec![],
+            };
+            assert_eq!(context_matches(&intent, vector[4], vector[0]), vector[6] == 1);
+            assert_eq!(vector[0] <= vector[1], vector[7] == 1);
         }
     }
 }

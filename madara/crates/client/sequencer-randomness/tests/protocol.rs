@@ -22,7 +22,7 @@ impl Fixture {
 #[test]
 fn canonical_cross_language_vectors() {
     let mut fixture = Fixture {
-        fields: include_str!("fixtures/v2.txt")
+        fields: include_str!("fixtures/v3.txt")
             .split_whitespace()
             .map(|field| Felt::from_hex(field).unwrap())
             .collect::<Vec<_>>()
@@ -103,10 +103,8 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
     let envelope = Envelope {
         action: sample_intent().identity().unwrap(),
         order: 1,
-        preceding_state: Felt::ONE,
         timestamp: 2,
         execution_config: Felt::ONE,
-        l2_gas: 3,
         root: [255; 32],
     };
     let fields = envelope.encode().unwrap();
@@ -116,16 +114,14 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
     let mut trailing = fields.clone();
     trailing.push(Felt::ZERO);
     assert!(Envelope::decode(&trailing).is_err());
-    for index in [0, 1, 3, 5, 7, 8, 9] {
+    for index in [0, 1, 3, 4, 6, 7] {
         let mut malformed = fields.clone();
         malformed[index] = Felt::MAX;
         assert!(Envelope::decode(&malformed).is_err());
     }
-    for index in [3, 7] {
-        let mut zero = fields.clone();
-        zero[index] = Felt::ZERO;
-        assert!(Envelope::decode(&zero).is_err());
-    }
+    let mut zero_order = fields.clone();
+    zero_order[3] = Felt::ZERO;
+    assert!(Envelope::decode(&zero_order).is_err());
     for index in 2..fields.len() {
         let mut changed = fields.clone();
         changed[index] += Felt::ONE;

@@ -379,6 +379,7 @@ pub enum MadaraServiceId {
     Telemetry,
     Mempool,
     ExternalDb,
+    GameSequencing,
 }
 
 impl ServiceId for MadaraServiceId {
@@ -396,6 +397,7 @@ impl ServiceId for MadaraServiceId {
             MadaraServiceId::Telemetry => PowerOfTwo::P7,
             MadaraServiceId::Mempool => PowerOfTwo::P8,
             MadaraServiceId::ExternalDb => PowerOfTwo::P9,
+            MadaraServiceId::GameSequencing => PowerOfTwo::P10,
         }
     }
 }
@@ -417,6 +419,7 @@ impl Display for MadaraServiceId {
                 Self::Telemetry => "telemetry",
                 Self::Mempool => "mempool",
                 Self::ExternalDb => "external db",
+                Self::GameSequencing => "game sequencing",
             }
         )
     }

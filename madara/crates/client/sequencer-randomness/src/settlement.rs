@@ -8,7 +8,7 @@ use starknet_core::{
 use starknet_providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, ProviderError};
 use starknet_types_core::hash::{Poseidon, StarkHash};
 
-/// The schema fixes the command layout; accepted arguments already persist in the journal.
+/// The schema fixes the command layout; recorded arguments travel in the execution transaction.
 pub(crate) struct SettlementChecks {
     tag: Felt,
     season_tag: Felt,
