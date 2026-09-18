@@ -160,6 +160,11 @@ impl Default for DbWriteMode {
 }
 
 impl DbWriteMode {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.fsync || self.wal, "Database fsync requires WAL to be enabled");
+        Ok(())
+    }
+
     /// Convert the write mode to RocksDB WriteOptions
     pub fn to_write_options(&self) -> WriteOptions {
         let mut opts = WriteOptions::default();
@@ -168,9 +173,7 @@ impl DbWriteMode {
             opts.disable_wal(true);
         }
 
-        if !self.fsync {
-            opts.set_sync(false);
-        }
+        opts.set_sync(self.fsync);
 
         opts
     }
@@ -181,7 +184,7 @@ impl std::fmt::Display for DbWriteMode {
         match (self.wal, self.fsync) {
             (true, true) => write!(f, "WAL enabled, fsync enabled (safest)"),
             (true, false) => write!(f, "WAL enabled, fsync disabled (recommended)"),
-            (false, true) => write!(f, "WAL disabled, fsync enabled (fast)"),
+            (false, true) => write!(f, "invalid: fsync requires WAL"),
             (false, false) => write!(f, "WAL disabled, fsync disabled (fastest, least safe)"),
         }
     }
@@ -579,6 +582,40 @@ mod tests {
     use crate::rocksdb::column::ALL_COLUMNS;
     use crate::rocksdb::RocksDBStorage;
     use std::fs;
+
+    #[test]
+    fn fsync_without_wal_is_rejected_before_database_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-open");
+        let config = RocksDBConfig { write_mode: DbWriteMode { wal: false, fsync: true }, ..Default::default() };
+        let error = RocksDBStorage::open(&path, config).err().expect("invalid durability must be rejected");
+        assert_eq!(error.to_string(), "Database fsync requires WAL to be enabled");
+        assert!(!path.exists(), "invalid configuration must not create the database");
+    }
+
+    #[test]
+    fn write_mode_controls_real_wal_sync() {
+        use rocksdb::statistics::Ticker;
+        use rocksdb::DB;
+
+        for mode in [
+            DbWriteMode { wal: false, fsync: false },
+            DbWriteMode { wal: true, fsync: false },
+            DbWriteMode { wal: true, fsync: true },
+        ] {
+            mode.validate().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Options::default();
+            options.create_if_missing(true);
+            options.enable_statistics();
+            options.set_statistics_level(StatsLevel::All);
+            let database = DB::open(&options, directory.path()).unwrap();
+            let syncs_before = options.get_ticker_count(Ticker::WalFileSynced);
+            database.put_opt(b"key", b"value", &mode.to_write_options()).unwrap();
+            assert_eq!(database.get(b"key").unwrap().as_deref(), Some(b"value".as_slice()));
+            assert_eq!(options.get_ticker_count(Ticker::WalFileSynced) - syncs_before, u64::from(mode.fsync));
+        }
+    }
 
     fn column_family_section<'a>(options: &'a str, column: &str) -> &'a str {
         let header = format!("[CFOptions \"{column}\"]");
