@@ -54,6 +54,42 @@ fn make_l1_handler_tx(
     (tx, AdditionalTxInfo::new(declared_class, Default::default()))
 }
 
+#[cfg(feature = "sequencer-randomness")]
+#[tokio::test]
+async fn refused_binding_authority_transaction_notifies_its_observer() {
+    use crate::tests::make_invoke_tx;
+    use crate::CurrentBlockState;
+    use mc_db::preconfirmed::PreconfirmedBlock;
+    use mc_devnet::Multicall;
+    use mc_sequencer_randomness::submission::ExecutionObservers;
+
+    let setup = devnet_setup(Duration::from_secs(30000), false, true).await;
+    let sender = &setup.contracts.0[0];
+    let observers = ExecutionObservers::new(Felt::from(999));
+    assert_ne!(sender.address, observers.account);
+    let mut transaction = make_invoke_tx(sender, Multicall::default(), &setup.backend, Felt::ZERO);
+    let mp_rpc::v0_9_0::BroadcastedInvokeTxn::V3(ref mut fields) = transaction else { unreachable!() };
+    // Model an executor refusal after submission validation.
+    fields.signature = vec![Felt::ZERO, Felt::ZERO].into();
+    let (tx, info) = make_tx(&setup.backend, BroadcastedTxn::Invoke(transaction));
+    let refusal = observers.watch(tx.tx_hash().0);
+    let mut batch: BatchToExecute = [(tx, info)].into_iter().collect();
+    crate::randomness::observe_batch(&observers, &mut batch);
+    let (_commands_sender, commands) = mpsc::unbounded_channel();
+    let mut handle = start_executor_thread(setup.backend.clone(), commands, setup.metrics.clone(), false).unwrap();
+    handle.send_batch.as_ref().unwrap().send(batch).await.unwrap();
+    let Some(ExecutorMessage::StartNewBlock { exec_ctx }) = handle.replies.recv().await else {
+        panic!("expected block start")
+    };
+    let block_n = exec_ctx.block_number;
+    setup.backend.write_access().new_preconfirmed(PreconfirmedBlock::new(exec_ctx.into_header())).unwrap();
+    let Some(ExecutorMessage::BatchExecuted(result)) = handle.replies.recv().await else { panic!("expected results") };
+    assert!(result.blockifier_results[0].is_err());
+    let mut current = CurrentBlockState::new(setup.backend.clone(), block_n);
+    current.append_batch(result).await.unwrap();
+    assert!(refusal.receiver.borrow().as_ref().is_some_and(|reason| reason.contains("signature")));
+}
+
 struct L1HandlerSetup {
     backend: Arc<MadaraBackend>,
     handle: ExecutorThreadHandle,

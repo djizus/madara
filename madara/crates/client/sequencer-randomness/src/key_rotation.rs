@@ -17,7 +17,7 @@ pub(crate) async fn submit(
     slots: &AdmissionSlots,
     transaction: BroadcastedInvokeTxn,
 ) -> anyhow::Result<Felt> {
-    let (actor, authority, hash, signature) =
+    let Rotation { actor, authority, nonce, hash, signature } =
         decode(&transaction, node.backend.chain_config().chain_id.clone().to_felt())?;
     let authentication = node.world_view("authentication", vec![]).await?;
     let [_, registry, class] = authentication.as_slice() else {
@@ -38,6 +38,7 @@ pub(crate) async fn submit(
         matches!(starknet_crypto::verify(&key, &hash, &signature[0], &signature[1]), Ok(true)),
         "invalid binding authority signature"
     );
+    ensure!(nonce == node.nonce(authority)?, "rotation requires the current binding authority nonce");
     let _permit = slots.rotation(actor).await?;
     match node.execute(hash, transaction).await? {
         Execution::Included(receipt) => {
@@ -48,7 +49,15 @@ pub(crate) async fn submit(
     }
 }
 
-fn decode(transaction: &BroadcastedInvokeTxn, chain: Felt) -> anyhow::Result<(Felt, Felt, Felt, [Felt; 2])> {
+struct Rotation {
+    actor: Felt,
+    authority: Felt,
+    nonce: Felt,
+    hash: Felt,
+    signature: [Felt; 2],
+}
+
+fn decode(transaction: &BroadcastedInvokeTxn, chain: Felt) -> anyhow::Result<Rotation> {
     let BroadcastedInvokeTxn::V3(transaction) = transaction else { anyhow::bail!("rotation requires an invoke v3") };
     ensure!(transaction.proof.is_none() && transaction.proof_facts.is_none(), "rotation cannot carry proofs");
     let tx = InvokeTransactionV3::from(transaction.clone());
@@ -65,7 +74,13 @@ fn decode(transaction: &BroadcastedInvokeTxn, chain: Felt) -> anyhow::Result<(Fe
     );
     ensure!(tx.paymaster_data.is_empty() && tx.account_deployment_data.is_empty(), "unsupported rotation transaction");
     let signature = tx.signature.as_slice().try_into().context("rotation requires two signature felts")?;
-    Ok((*actor, tx.sender_address, tx.compute_hash(chain, false), signature))
+    Ok(Rotation {
+        actor: *actor,
+        authority: tx.sender_address,
+        nonce: tx.nonce,
+        hash: tx.compute_hash(chain, false),
+        signature,
+    })
 }
 
 async fn scalar(node: &Node, contract: Felt, name: &'static str, args: Vec<Felt>) -> anyhow::Result<Felt> {
@@ -106,8 +121,9 @@ mod tests {
         let rpc = tx.to_rpc_v0_10_2();
         let mut broadcast =
             BroadcastedInvokeTxn::V3(BroadcastedInvokeTxnV3 { inner: rpc.inner, proof: None, proof_facts: None });
-        let (actor, authority, hash, signature) = decode(&broadcast, Felt::from(9)).unwrap();
+        let Rotation { actor, authority, nonce, hash, signature } = decode(&broadcast, Felt::from(9)).unwrap();
         assert_eq!((actor, authority, hash), (Felt::from(11), Felt::from(7), identity));
+        assert_eq!(nonce, Felt::from(3));
         assert!(starknet_crypto::verify(&key.verifying_key().scalar(), &hash, &signature[0], &signature[1]).unwrap());
         if let BroadcastedInvokeTxn::V3(ref mut fields) = broadcast {
             Arc::make_mut(&mut fields.inner.calldata).push(Felt::ONE);

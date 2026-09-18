@@ -18,7 +18,7 @@ impl ExecutionObservers {
         Self { account, waiting: Default::default() }
     }
 
-    pub(crate) fn watch(&self, transaction: Felt) -> RefusalWatch {
+    pub fn watch(&self, transaction: Felt) -> RefusalWatch {
         let (sender, receiver) = watch::channel(None);
         self.waiting.lock().expect("execution observers poisoned").insert(transaction, sender);
         RefusalWatch { transaction, observers: self.clone(), receiver }
@@ -37,7 +37,7 @@ impl RefusalReporter {
     }
 }
 
-pub(crate) struct RefusalWatch {
+pub struct RefusalWatch {
     transaction: Felt,
     observers: ExecutionObservers,
     pub receiver: watch::Receiver<Option<String>>,
