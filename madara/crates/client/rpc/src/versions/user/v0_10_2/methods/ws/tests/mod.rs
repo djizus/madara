@@ -181,3 +181,68 @@ async fn wait_for_active_subscriptions(starknet: &Starknet, expected: usize) {
 mod new_heads;
 mod receipts;
 mod transaction_status;
+
+#[rstest::rstest]
+#[case("subscribeNewHeads")]
+#[case("subscribeEvents")]
+#[case("subscribeNewTransactions")]
+#[case("subscribeNewTransactionReceipts")]
+#[case("subscribeTransactionStatus")]
+#[tokio::test]
+async fn unsubscribe_closes_without_error_notification(
+    #[case] method: &str,
+    #[values("V0_10_0", "V0_10_2")] version: &str,
+) {
+    let (backend, mut starknet) = rpc_test_setup();
+    add_block_at(&backend, 0);
+    starknet.set_tx_status_watcher(Some(TestTxStatusWatcher::new()));
+    let module = match version {
+        "V0_10_0" => StarknetWsRpcApiV0_10_0Server::into_rpc(starknet.clone()),
+        _ => StarknetWsRpcApiV0_10_2Server::into_rpc(starknet.clone()),
+    };
+    let params = if method == "subscribeTransactionStatus" {
+        serde_json::json!({ "transaction_hash": TX_HASH })
+    } else {
+        serde_json::json!({})
+    };
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": format!("starknet_{version}_{method}"), "params": params,
+    });
+    let (response, mut frames) = module.raw_json_request(&request.to_string(), 16).await.unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    let id = response["result"].as_u64().expect("Subscription id");
+    wait_for_active_subscriptions(&starknet, 1).await;
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2,
+        "method": format!("starknet_{version}_unsubscribe"), "params": [id.to_string()],
+    });
+    let (response, _) = module.raw_json_request(&request.to_string(), 16).await.unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["result"], true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = frames.recv().await {
+            let frame: Value = serde_json::from_str(&frame).expect("Valid subscription JSON");
+            assert!(frame["params"].get("error").is_none(), "{frame}");
+        }
+    })
+    .await
+    .expect("Unsubscribe must close the stream");
+    wait_for_active_subscriptions(&starknet, 0).await;
+}
+
+#[tokio::test]
+async fn subscription_failure_emits_valid_json() {
+    let (_backend, starknet) = rpc_test_setup();
+    // An accepted subscription without a status watcher fails on the server.
+    let module = StarknetWsRpcApiV0_10_2Server::into_rpc(starknet);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "starknet_V0_10_2_subscribeTransactionStatus",
+        "params": { "transaction_hash": TX_HASH },
+    });
+    let (_, mut frames) = module.raw_json_request(&request.to_string(), 16).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap().unwrap();
+    let frame: Value = serde_json::from_str(&frame).expect("Valid error notification JSON");
+    assert_eq!(frame["params"]["error"], "Internal error");
+}

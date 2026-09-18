@@ -30,7 +30,7 @@ pub async fn subscribe_new_heads(
                 return Ok(());
             }
             if ctx.is_cancelled() {
-                return Err(crate::errors::StarknetWsApiError::SubscriptionClosed);
+                return Ok(());
             }
 
             match reorgs.try_recv() {
@@ -61,7 +61,7 @@ pub async fn subscribe_new_heads(
                 return Err(StarknetWsApiError::internal_server_error(err));
             }
             if ctx.is_cancelled() {
-                return Err(crate::errors::StarknetWsApiError::SubscriptionClosed);
+                return Ok(());
             }
 
             send_block_header(&sink, block_info, block_n).await?;
@@ -91,7 +91,7 @@ pub async fn subscribe_new_heads(
                     }
                 },
                 _ = sink.closed() => return Ok(()),
-                _ = ctx.cancelled() => return Err(crate::errors::StarknetWsApiError::SubscriptionClosed),
+                _ = ctx.cancelled() => return Ok(()),
             };
 
             let next_block_n =

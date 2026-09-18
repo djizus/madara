@@ -111,6 +111,7 @@ async fn subscribe_new_heads_err_l1_accepted_v0_10_2() {
 async fn subscribe_new_heads_unsubscribe_uses_string_id_v0_10_2() {
     let (backend, starknet) = rpc_test_setup();
     let _header = add_block_at(&backend, 0);
+    let starknet_for_assert = starknet.clone();
     let (_handle, server_url) = start_server(starknet).await;
     let client = WsClientBuilder::default().build(&server_url).await.expect("Building client");
 
@@ -122,11 +123,15 @@ async fn subscribe_new_heads_unsubscribe_uses_string_id_v0_10_2() {
         .expect("Waiting for block header")
         .expect("Waiting for block header");
 
-    StarknetWsRpcApiV0_10_2Client::starknet_unsubscribe(&client, "0".into())
+    assert!(StarknetWsRpcApiV0_10_2Client::starknet_unsubscribe(&client, "0".into())
         .await
-        .expect("Failed to close subscription");
+        .expect("Failed to close subscription"));
 
-    assert!(sub.next().await.is_none());
+    wait_for_active_subscriptions(&starknet_for_assert, 0).await;
+    add_block_at(&backend, 1);
+    // Explicit unsubscribe stops notifications; it does not close the socket or
+    // emit an error to dispose of a subscription in the client's local registry.
+    assert!(tokio::time::timeout(Duration::from_millis(100), sub.next()).await.is_err());
 }
 
 #[test]
