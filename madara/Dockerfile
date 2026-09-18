@@ -112,10 +112,9 @@ RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     . /app/sequencer_venv/bin/activate && \
     CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo chef cook --release --locked --package madara --bin madara --features "$CARGO_FEATURES" --recipe-path recipe.json
 
-COPY Cargo.toml Cargo.lock ./
-COPY madara madara
-COPY build-artifacts build-artifacts
-COPY .db-versions.yml .db-versions.yml
+# Restore every workspace manifest after cargo-chef's dependency-only skeleton.
+# A partial copy leaves generated manifests that no longer match Cargo.lock.
+COPY . .
 
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry \
