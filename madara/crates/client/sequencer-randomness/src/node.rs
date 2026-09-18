@@ -79,7 +79,10 @@ impl Node {
     }
 
     pub fn nonce(&self, account: Felt) -> anyhow::Result<Felt> {
-        self.backend.view_on_latest().get_contract_nonce(&account)?.context("account is not deployed")
+        let view = self.backend.view_on_latest();
+        ensure!(view.is_contract_deployed(&account)?, "account is not deployed");
+        // A deployed account has nonce zero until its first account transaction.
+        Ok(view.get_contract_nonce(&account)?.unwrap_or(Felt::ZERO))
     }
 
     pub fn timestamp(&self) -> anyhow::Result<u64> {
