@@ -4,7 +4,6 @@ use crate::{
     execution::{self, PendingTicket},
     node::{Execution, Node},
     protocol::{Envelope, Intent},
-    settlement::SettlementChecks,
     submission::ExecutionObservers,
     ticket::{context_matches, ActionRequest, ActionStatus, RecordedTicket},
 };
@@ -154,7 +153,6 @@ impl GameApi {
 
 pub struct GameService {
     api: GameApi,
-    settlement: Arc<SettlementChecks>,
     secret_path: PathBuf,
 }
 
@@ -174,16 +172,13 @@ impl GameService {
             key: SigningKey::from_secret_scalar(Felt::from_hex(&required("RANDOMNESS_PRIVATE_KEY")?)?),
             l2_gas: 1_200_000_000,
         });
-        let schema = std::fs::read_to_string(required("RANDOMNESS_NATIVE_SCHEMA")?)?;
-        let l2 = std::env::var("RANDOMNESS_L2_RPC_URL").ok().filter(|url| !url.is_empty());
-        let settlement = Arc::new(SettlementChecks::load(&schema, l2.as_deref())?);
         let api = GameApi(Arc::new(Shared {
             node,
             slots: AdmissionSlots::default(),
             sender: Mutex::new(None),
             ip_limits: Mutex::new(IpLimits::default()),
         }));
-        Ok(Self { api, settlement, secret_path: PathBuf::from(required("RANDOMNESS_EPOCH_SECRET")?) })
+        Ok(Self { api, secret_path: PathBuf::from(required("RANDOMNESS_EPOCH_SECRET")?) })
     }
     pub fn api(&self) -> GameApi {
         self.api.clone()
@@ -198,10 +193,9 @@ pub fn required(name: &str) -> anyhow::Result<String> {
 impl Service for GameService {
     async fn start<'a>(&mut self, runner: ServiceRunner<'a>) -> anyhow::Result<()> {
         let api = self.api.clone();
-        let settlement = self.settlement.clone();
         let secret_path = self.secret_path.clone();
         runner.service_loop(move |mut ctx| async move {
-            let result = ctx.run_until_cancelled(run(api.clone(), settlement, secret_path)).await;
+            let result = ctx.run_until_cancelled(run(api.clone(), secret_path)).await;
             api.0.sender.lock().expect("admission sender poisoned").take();
             if let Some(Err(error)) = result {
                 // Game admission can fail closed without stopping ordinary block production.
@@ -219,7 +213,7 @@ impl ServiceId for GameService {
     }
 }
 
-async fn run(api: GameApi, settlement: Arc<SettlementChecks>, path: PathBuf) -> anyhow::Result<()> {
+async fn run(api: GameApi, path: PathBuf) -> anyhow::Result<()> {
     let node = api.0.node.clone();
     let mut tip = node.backend.watch_chain_tip();
     while node.backend.view_on_latest().get_contract_class_hash(&node.deployment)?.is_none()
@@ -249,7 +243,7 @@ async fn run(api: GameApi, settlement: Arc<SettlementChecks>, path: PathBuf) -> 
             request = requests.recv(), if queue.len() < MAX_BATCH && order <= epoch.last_order => {
                 let request = request.context("game request queue closed")?;
                 let action = request.intent.identity()?;
-                match accept(&node, &settlement, &epoch, order, &request).await {
+                match accept(&node, &epoch, order, &request).await {
                     Ok(record) => {
                         request.permit.resolve(ActionStatus::Accepted { action, order });
                         tracing::debug!(target: "sequencer_randomness", %action, order,
@@ -270,13 +264,7 @@ async fn run(api: GameApi, settlement: Arc<SettlementChecks>, path: PathBuf) -> 
     }
 }
 
-async fn accept(
-    node: &Node,
-    settlement: &SettlementChecks,
-    epoch: &EpochSecret,
-    order: u64,
-    request: &Request,
-) -> anyhow::Result<RecordedTicket> {
+async fn accept(node: &Node, epoch: &EpochSecret, order: u64, request: &Request) -> anyhow::Result<RecordedTicket> {
     let intent = &request.intent;
     let fields = node.world_view("get_admission", vec![intent.game, intent.actor]).await?;
     let [key, rules, config, nonce, _, observed_time] = fields.as_slice() else {
@@ -289,14 +277,6 @@ async fn accept(
     let timestamp = node.timestamp()?;
     let now: u64 = (*observed_time).try_into()?;
     ensure!(context_matches(intent, order, timestamp) && now <= intent.valid_until, "intent expired before acceptance");
-    if settlement.is_settlement(intent) {
-        let policy = node.world_view("settlement_admission", vec![intent.game, intent.actor]).await?;
-        ensure!(settlement.verify(intent, &policy).await?, "settlement admission rejected");
-        let current = node.world_view("get_admission", vec![intent.game, intent.actor]).await?;
-        ensure!(current.get(..4) == fields.get(..4), "actor changed during settlement checks");
-        let now: u64 = (*current.get(5).context("missing admission timestamp")?).try_into()?;
-        ensure!(now <= intent.valid_until, "intent expired during settlement checks");
-    }
     Ok(RecordedTicket {
         intent: intent.clone(),
         envelope: Envelope {
