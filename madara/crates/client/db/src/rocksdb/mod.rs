@@ -284,6 +284,7 @@ fn revert_single_trie<H: StarkHash + Send + Sync>(
 
 impl RocksDBStorage {
     pub fn open(path: &Path, config: RocksDBConfig) -> Result<Self> {
+        config.write_mode.validate()?;
         let opts = rocksdb_global_options(&config)?;
         tracing::debug!("Opening db at {:?}", path.display());
         let db = DB::open_cf_descriptors(
