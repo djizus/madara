@@ -112,10 +112,9 @@ RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     . /app/sequencer_venv/bin/activate && \
     CARGO_TARGET_DIR=target RUST_BUILD_DOCKER=1 cargo chef cook --release --locked --package madara --bin madara --features "$CARGO_FEATURES" --recipe-path recipe.json
 
-COPY Cargo.toml Cargo.lock ./
-COPY madara madara
-COPY build-artifacts build-artifacts
-COPY .db-versions.yml .db-versions.yml
+# Restore every workspace manifest after cargo-chef's dependency-only skeleton.
+# A partial copy leaves generated manifests that no longer match Cargo.lock.
+COPY . .
 
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry \
@@ -126,9 +125,19 @@ RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
 # dependency graph is retained from this build, never read from the release host.
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    NATIVE_VERSION=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "cairo-native"))') && \
-    cargo install --locked --root /native-tools starknet-native-compile --version "$NATIVE_VERSION" && \
-    python3 -c 'import glob,shutil,sys; paths=glob.glob("/usr/local/cargo/registry/src/*/starknet-native-compile-"+sys.argv[1]+"/Cargo.lock"); assert len(paths)==1, paths; shutil.copyfile(paths[0], "/native-tools/Cargo.lock")' "$NATIVE_VERSION"
+    python3 - <<'PYCOMPILER'
+import json
+from pathlib import Path
+import shutil
+import subprocess
+
+graph = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
+compiler = next(package for package in graph["packages"] if package["name"] == "cairo-native")
+source = Path(compiler["manifest_path"]).parent
+subprocess.run(["cargo", "install", "--locked", "--root", "/native-tools",
+                "--path", str(source / "binaries/starknet-native-compile")], check=True)
+shutil.copyfile(source / "Cargo.lock", "/native-tools/Cargo.lock")
+PYCOMPILER
 
 # Step 3: runner
 FROM debian:bookworm-slim AS runner
