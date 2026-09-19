@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 #[cfg(feature = "sequencer-randomness")]
 #[path = "randomness.rs"]
-mod randomness;
+pub(crate) mod randomness;
 
 pub struct Batcher {
     backend: Arc<MadaraBackend>,

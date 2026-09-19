@@ -74,9 +74,9 @@ async fn refused_binding_authority_transaction_notifies_its_observer() {
     let (tx, info) = make_tx(&setup.backend, BroadcastedTxn::Invoke(transaction));
     let refusal = observers.watch(tx.tx_hash().0);
     let mut batch: BatchToExecute = [(tx, info)].into_iter().collect();
-    crate::randomness::observe_batch(&observers, &mut batch);
+    crate::batcher::randomness::observe_batch(&observers, &mut batch);
     let (_commands_sender, commands) = mpsc::unbounded_channel();
-    let mut handle = start_executor_thread(setup.backend.clone(), commands, setup.metrics.clone(), false).unwrap();
+    let mut handle = start_executor_thread(setup.backend.clone(), commands, setup.metrics.clone()).unwrap();
     handle.send_batch.as_ref().unwrap().send(batch).await.unwrap();
     let Some(ExecutorMessage::StartNewBlock { exec_ctx }) = handle.replies.recv().await else {
         panic!("expected block start")
