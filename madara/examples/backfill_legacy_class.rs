@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     .context("Opening Madara backend")?;
 
     if backend.db.get_class(&class_hash)?.is_some() {
-        println!("Class {class_hash:#x} is already present in the database");
+        tracing::info!("Class {class_hash:#x} is already present in the database");
         return Ok(());
     }
 
@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
 
     match class_info {
         ClassInfo::Legacy(_) => {
-            println!("Backfilled legacy class {class_hash:#x} into {}", args.db_path.display());
+            tracing::info!("Backfilled legacy class {class_hash:#x} into {}", args.db_path.display());
         }
         ClassInfo::Sierra(_) => bail!("Class {class_hash:#x} resolved to Sierra after legacy backfill"),
     }
