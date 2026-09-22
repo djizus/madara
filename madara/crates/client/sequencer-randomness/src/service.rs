@@ -19,6 +19,7 @@ use mp_utils::service::{MadaraServiceId, PowerOfTwo, Service, ServiceId, Service
 use starknet_signers::SigningKey;
 use starknet_types_core::felt::Felt;
 use std::{
+    collections::HashMap,
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -29,7 +30,7 @@ use tokio::sync::{mpsc, watch};
 const QUEUE_CAPACITY: usize = 128;
 const MAX_BATCH: usize = 16;
 const PACK_DELAY: Duration = Duration::from_millis(10);
-const EPOCH_ORDERS: u64 = 100_000;
+const EPOCH_TICKETS: u64 = 100_000;
 
 struct Request {
     intent: Intent,
@@ -222,8 +223,10 @@ async fn run(api: GameApi, path: PathBuf) -> anyhow::Result<()> {
         tip.recv().await;
     }
     node.drain_retained().await?;
-    let mut epoch = prepare_epoch(&node, &path).await?;
-    let mut order = node.head().await?.0 + 1;
+    let mut epoch = rotate_epoch(&node, &path).await?;
+    let mut admitted = 0;
+    // Each game's next order, read from its recorded head the first time the game is seen.
+    let mut orders = HashMap::new();
     let (sender, mut requests) = mpsc::channel(QUEUE_CAPACITY);
     *api.0.sender.lock().expect("admission sender poisoned") = Some(sender);
     let mut queue = Vec::new();
@@ -236,21 +239,24 @@ async fn run(api: GameApi, path: PathBuf) -> anyhow::Result<()> {
         {
             flight = Some(execution::execute(node.clone(), std::mem::take(&mut queue)).boxed());
         }
-        if flight.is_none() && queue.is_empty() && order > epoch.last_order {
-            epoch = prepare_epoch(&node, &path).await?;
+        if flight.is_none() && queue.is_empty() && admitted >= EPOCH_TICKETS {
+            epoch = rotate_epoch(&node, &path).await?;
+            admitted = 0;
         }
         tokio::select! {
-            request = requests.recv(), if queue.len() < MAX_BATCH && order <= epoch.last_order => {
+            request = requests.recv(), if queue.len() < MAX_BATCH && admitted < EPOCH_TICKETS => {
                 let request = request.context("game request queue closed")?;
                 let action = request.intent.identity()?;
-                match accept(&node, &epoch, order, &request).await {
+                match accept(&node, &epoch, &orders, &request).await {
                     Ok(record) => {
+                        let (game, order) = (record.intent.game, record.envelope.order);
                         request.permit.resolve(ActionStatus::Accepted { action, order });
-                        tracing::debug!(target: "sequencer_randomness", %action, order,
+                        tracing::debug!(target: "sequencer_randomness", %action, %game, order,
                             admission_ms = request.received.elapsed().as_secs_f64() * 1000.0, "game_action_accepted");
                         if queue.is_empty() { deadline = tokio::time::Instant::now() + PACK_DELAY; }
                         queue.push(PendingTicket { record, permit: request.permit });
-                        order += 1;
+                        orders.insert(game, order + 1);
+                        admitted += 1;
                     }
                     Err(error) => request.permit.resolve(ActionStatus::Refused { action, reason: error.to_string() }),
                 }
@@ -264,11 +270,20 @@ async fn run(api: GameApi, path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
-async fn accept(node: &Node, epoch: &EpochSecret, order: u64, request: &Request) -> anyhow::Result<RecordedTicket> {
+async fn accept(
+    node: &Node,
+    epoch: &EpochSecret,
+    orders: &HashMap<Felt, u64>,
+    request: &Request,
+) -> anyhow::Result<RecordedTicket> {
     let intent = &request.intent;
     let fields = node.world_view("get_admission", vec![intent.game, intent.actor]).await?;
-    let [key, rules, config, nonce, _, observed_time] = fields.as_slice() else {
+    let [key, rules, config, nonce, recorded_next, observed_time] = fields.as_slice() else {
         anyhow::bail!("malformed admission view")
+    };
+    let order = match orders.get(&intent.game) {
+        Some(order) => *order,
+        None => (*recorded_next).try_into()?,
     };
     ensure!(
         *key == request.public_key && *rules == intent.rules && *nonce == Felt::from(intent.nonce),
@@ -284,50 +299,36 @@ async fn accept(node: &Node, epoch: &EpochSecret, order: u64, request: &Request)
             order,
             timestamp,
             execution_config: *config,
-            root: epoch.root(order)?,
+            epoch: epoch.epoch,
+            root: epoch.root(intent.game, order),
         },
         r: request.signature[0],
         s: request.signature[1],
     })
 }
 
-async fn prepare_epoch(node: &Node, path: &std::path::Path) -> anyhow::Result<EpochSecret> {
-    let (head, _, _) = node.head().await?;
+/// Every start and every rotation reveals the open epoch and commits a fresh secret. Callers
+/// rotate only with nothing queued or in flight, so no assigned root outlives its epoch.
+async fn rotate_epoch(node: &Node, path: &std::path::Path) -> anyhow::Result<EpochSecret> {
     let account = node.observers.account;
     let current = node.view(account, "current_randomness_epoch", vec![]).await?;
     let [id] = current.as_slice() else { anyhow::bail!("malformed current epoch") };
-    if *id != Felt::ZERO {
-        let epoch = node.view(account, "get_randomness_epoch", vec![*id]).await?;
-        let [first, last, commitment, revealed, ..] = epoch.as_slice() else {
-            anyhow::bail!("malformed randomness epoch")
-        };
-        if *revealed == Felt::ONE {
+    let id: u64 = (*id).try_into()?;
+    if id != 0 {
+        let epoch = node.view(account, "get_randomness_epoch", vec![id.into()]).await?;
+        let [commitment, unrevealed, ..] = epoch.as_slice() else { anyhow::bail!("malformed randomness epoch") };
+        if *unrevealed == Felt::ONE {
             let secret = EpochSecret::load(path)?;
             ensure!(
-                secret.commitment() == *commitment
-                    && Felt::from(secret.first_order) == *first
-                    && Felt::from(secret.last_order) == *last,
+                secret.epoch == id && secret.commitment() == *commitment,
                 "epoch secret does not match chain commitment"
             );
-            if head < secret.last_order {
-                return Ok(secret);
-            }
-            ensure!(head == secret.last_order, "execution head exceeds unrevealed epoch");
             epoch_command(node, "reveal_randomness_epoch", secret.reveal().to_vec()).await?;
         }
     }
-    let secret = if path.exists() {
-        let candidate = EpochSecret::load(path)?;
-        if candidate.first_order == head + 1 {
-            candidate
-        } else {
-            EpochSecret::create(head + 1, head.checked_add(EPOCH_ORDERS).context("epoch order overflow")?)?
-        }
-    } else {
-        EpochSecret::create(head + 1, head.checked_add(EPOCH_ORDERS).context("epoch order overflow")?)?
-    };
+    let secret = EpochSecret::create(id + 1)?;
     secret.save(path)?;
-    epoch_command(node, "open_randomness_epoch", vec![secret.commitment(), secret.last_order.into()]).await?;
+    epoch_command(node, "open_randomness_epoch", vec![secret.commitment()]).await?;
     Ok(secret)
 }
 

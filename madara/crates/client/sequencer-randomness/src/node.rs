@@ -96,8 +96,8 @@ impl Node {
             .0)
     }
 
-    pub async fn head(&self) -> anyhow::Result<(u64, u64, Felt)> {
-        let fields = self.world_view("get_head", vec![]).await?;
+    pub async fn head(&self, game: Felt) -> anyhow::Result<(u64, u64, Felt)> {
+        let fields = self.world_view("get_head", vec![game]).await?;
         let [order, timestamp, state] = fields.as_slice() else { anyhow::bail!("malformed execution head") };
         Ok(((*order).try_into()?, (*timestamp).try_into()?, *state))
     }
@@ -267,6 +267,7 @@ mod tests {
                 order: 7,
                 timestamp: 10,
                 execution_config: Felt::ONE,
+                epoch: 1,
                 root: [123; 32],
             },
             intent: intent.clone(),
@@ -274,9 +275,9 @@ mod tests {
             s: Felt::TWO,
         };
         let mut second = first.clone();
-        second.intent.actor = Felt::from(56);
+        // Another game at the same order: attribution follows the intent, never the order alone.
+        second.intent.game = Felt::from(10);
         second.envelope.action = second.intent.identity().unwrap();
-        second.envelope.order = 8;
         let mut payload = vec![Felt::TWO];
         payload.extend(first.calldata().unwrap());
         payload.extend(second.calldata().unwrap());
@@ -315,7 +316,7 @@ mod tests {
         );
         assert!(matches!(
             recorded_intent(&calldata, &receipt, &second.intent).unwrap(),
-            Some(ActionStatus::Recorded { order: 8, .. })
+            Some(ActionStatus::Recorded { order: 7, action, .. }) if action == second.envelope.action
         ));
         let mut different = intent.clone();
         different.arguments[0] += Felt::ONE;

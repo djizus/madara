@@ -1,4 +1,6 @@
-use mc_sequencer_randomness::protocol::{decode_bytes, encode_bytes, root_limbs, Envelope, Intent, ProtocolError};
+use mc_sequencer_randomness::protocol::{
+    decode_bytes, encode_bytes, epoch_commitment, epoch_root, root_limbs, Envelope, Intent, ProtocolError,
+};
 use num_bigint::BigUint;
 use starknet_types_core::{
     felt::Felt,
@@ -22,7 +24,7 @@ impl Fixture {
 #[test]
 fn canonical_cross_language_vectors() {
     let mut fixture = Fixture {
-        fields: include_str!("fixtures/v3.txt")
+        fields: include_str!("fixtures/v4.txt")
             .split_whitespace()
             .map(|field| Felt::from_hex(field).unwrap())
             .collect::<Vec<_>>()
@@ -60,6 +62,16 @@ fn canonical_cross_language_vectors() {
             let actual = BigUint::from_bytes_be(&hash.to_bytes_be()) % BigUint::from_bytes_be(&bound.to_bytes_be());
             assert_eq!(actual, BigUint::from_bytes_be(&expected.to_bytes_be()));
         }
+    }
+    let epochs = usize::try_from(fixture.next()).unwrap();
+    for _ in 0..epochs {
+        let [low, high, commitment, game, order, root_low, root_high] = [(); 7].map(|_| fixture.next());
+        let mut secret = [0; 32];
+        secret[..16].copy_from_slice(&u128::try_from(high).unwrap().to_be_bytes());
+        secret[16..].copy_from_slice(&u128::try_from(low).unwrap().to_be_bytes());
+        assert_eq!(epoch_commitment(secret), commitment);
+        let root = epoch_root(secret, game, u64::try_from(order).unwrap());
+        assert_eq!(root_limbs(root), (u128::try_from(root_low).unwrap(), u128::try_from(root_high).unwrap()));
     }
     assert!(fixture.fields.next().is_none());
 }
@@ -105,6 +117,7 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
         order: 1,
         timestamp: 2,
         execution_config: Felt::ONE,
+        epoch: 1,
         root: [255; 32],
     };
     let fields = envelope.encode().unwrap();
@@ -114,7 +127,7 @@ fn rejects_invalid_envelopes_and_binds_execution_context() {
     let mut trailing = fields.clone();
     trailing.push(Felt::ZERO);
     assert!(Envelope::decode(&trailing).is_err());
-    for index in [0, 1, 3, 4, 6, 7] {
+    for index in [0, 1, 3, 4, 6, 7, 8] {
         let mut malformed = fields.clone();
         malformed[index] = Felt::MAX;
         assert!(Envelope::decode(&malformed).is_err());

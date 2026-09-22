@@ -39,7 +39,7 @@ impl RecordedTicket {
         let intent_len = 11 + arguments;
         let envelope_len: usize =
             (*fields.get(intent_len).ok_or_else(|| anyhow::anyhow!("truncated context"))?).try_into()?;
-        anyhow::ensure!(envelope_len == 8, "invalid context length");
+        anyhow::ensure!(envelope_len == 9, "invalid context length");
         let total = intent_len + 1 + envelope_len + 2;
         anyhow::ensure!(fields.len() >= total, "truncated recorded action");
         let intent = Intent::from_calldata(&fields[..intent_len])?;

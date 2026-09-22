@@ -1,10 +1,7 @@
-use crate::protocol::root_limbs;
+use crate::protocol::{epoch_commitment, epoch_root, root_limbs};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
-use starknet_types_core::{
-    felt::Felt,
-    hash::{Poseidon, StarkHash},
-};
+use starknet_types_core::felt::Felt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -12,34 +9,28 @@ use std::{
     path::Path,
 };
 
-const EPOCH_TAG: Felt = Felt::from_hex_unchecked("0x455445524e554d5f45504f4348");
-
 /// Only this secret survives restart. Tickets, assigned orders and roots do not.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EpochSecret {
-    pub first_order: u64,
-    pub last_order: u64,
+    pub epoch: u64,
     secret: [u8; 32],
 }
 
 impl EpochSecret {
-    pub fn create(first_order: u64, last_order: u64) -> anyhow::Result<Self> {
-        ensure!(first_order > 0 && last_order >= first_order, "invalid epoch range");
+    pub fn create(epoch: u64) -> anyhow::Result<Self> {
+        ensure!(epoch > 0, "invalid epoch");
         let mut secret = [0; 32];
         let filled = rustix::rand::getrandom(&mut secret, rustix::rand::GetRandomFlags::empty())?;
         ensure!(filled == secret.len(), "incomplete epoch entropy");
-        Ok(Self { first_order, last_order, secret })
+        Ok(Self { epoch, secret })
     }
 
     pub fn commitment(&self) -> Felt {
-        let (low, high) = root_limbs(self.secret);
-        Poseidon::hash_array(&[EPOCH_TAG, Felt::ONE, low.into(), high.into()])
+        epoch_commitment(self.secret)
     }
 
-    pub fn root(&self, order: u64) -> anyhow::Result<[u8; 32]> {
-        ensure!((self.first_order..=self.last_order).contains(&order), "order outside epoch");
-        let (low, high) = root_limbs(self.secret);
-        Ok(Poseidon::hash_array(&[low.into(), high.into(), order.into()]).to_bytes_be())
+    pub fn root(&self, game: Felt, order: u64) -> [u8; 32] {
+        epoch_root(self.secret, game, order)
     }
 
     pub fn reveal(&self) -> [Felt; 2] {
@@ -72,20 +63,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retained_secret_reconstructs_every_root_and_bounds_the_epoch() {
+    fn retained_secret_reconstructs_every_root_of_every_game() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("epoch.json");
-        let epoch = EpochSecret::create(7, 10).unwrap();
+        let epoch = EpochSecret::create(3).unwrap();
         epoch.save(&path).unwrap();
         let restored = EpochSecret::load(&path).unwrap();
-        assert_eq!(epoch.commitment(), restored.commitment());
-        assert_eq!(epoch.reveal(), restored.reveal());
-        for order in 7..=10 {
-            assert_eq!(epoch.root(order).unwrap(), restored.root(order).unwrap());
+        assert_eq!((restored.epoch, restored.commitment(), restored.reveal()), (3, epoch.commitment(), epoch.reveal()));
+        for game in [Felt::ONE, Felt::TWO] {
+            for order in 1..=4 {
+                assert_eq!(epoch.root(game, order), restored.root(game, order));
+            }
         }
-        assert!(epoch.root(6).is_err());
-        assert!(epoch.root(11).is_err());
-        let next = EpochSecret::create(11, 20).unwrap();
+        assert_ne!(epoch.root(Felt::ONE, 1), epoch.root(Felt::TWO, 1));
+        let next = EpochSecret::create(4).unwrap();
         next.save(&path).unwrap();
         assert_eq!(EpochSecret::load(&path).unwrap().commitment(), next.commitment());
         assert_ne!(next.commitment(), epoch.commitment());

@@ -26,7 +26,7 @@ pub(crate) trait ExecutionNode: Send + Sync {
     ) -> anyhow::Result<(Felt, BroadcastedInvokeTxn)>;
     async fn execute(&self, hash: Felt, transaction: BroadcastedInvokeTxn) -> anyhow::Result<Execution>;
     fn receipt(&self, hash: Felt) -> anyhow::Result<Option<TransactionReceipt>>;
-    async fn head_order(&self) -> anyhow::Result<u64>;
+    async fn head_order(&self, game: Felt) -> anyhow::Result<u64>;
     async fn wait_for_state_change(&self);
 }
 
@@ -49,8 +49,8 @@ impl ExecutionNode for Node {
     fn receipt(&self, hash: Felt) -> anyhow::Result<Option<TransactionReceipt>> {
         Node::receipt(self, hash)
     }
-    async fn head_order(&self) -> anyhow::Result<u64> {
-        Ok(self.head().await?.0)
+    async fn head_order(&self, game: Felt) -> anyhow::Result<u64> {
+        Ok(self.head(game).await?.0)
     }
     async fn wait_for_state_change(&self) {
         let mut tip = self.backend.watch_chain_head_state();
@@ -76,7 +76,7 @@ fn authentication_revert(reason: &str) -> bool {
         "backwards execution time",
         "malformed envelope",
         "invalid acceptance",
-        "order outside randomness epoch",
+        "stale randomness epoch",
         "revealed epoch cannot execute",
     ]
     .iter()
@@ -145,9 +145,11 @@ async fn execute_range(node: &impl ExecutionNode, tickets: &[PendingTicket], rej
             Some(Execution::Refused(reason)) if deterministic_limit(&reason) => return Ok(false),
             _ => {}
         }
-        let head = node.head_order().await?;
+        // A batch is atomic, so its first ticket's game shows whether it was included.
+        let first = &tickets[0].record;
+        let head = node.head_order(first.intent.game).await?;
         ensure!(
-            head < tickets[0].record.envelope.order,
+            head < first.envelope.order,
             "head already covers pending ticket but its matching receipt is unavailable"
         );
         // Wait for node state to move after a transient refusal, not a receipt poll.
@@ -231,23 +233,23 @@ mod tests {
     struct Prepared {
         selector: &'static str,
         payload: Vec<Felt>,
-        orders: Vec<u64>,
+        tickets: Vec<usize>,
     }
     struct State {
         prepared: Vec<Prepared>,
         submitted: Vec<Felt>,
         receipts: HashMap<Felt, TransactionReceipt>,
-        head: u64,
-        effects: Vec<u64>,
+        heads: HashMap<Felt, u64>,
+        effects: Vec<usize>,
     }
     struct TestNode {
         tickets: Vec<RecordedTicket>,
-        poison: Option<u64>,
+        poison: Option<usize>,
         first: FirstSubmission,
         state: Mutex<State>,
     }
     impl TestNode {
-        fn new(tickets: Vec<RecordedTicket>, poison: Option<u64>, first: FirstSubmission) -> Self {
+        fn new(tickets: Vec<RecordedTicket>, poison: Option<usize>, first: FirstSubmission) -> Self {
             Self {
                 tickets,
                 poison,
@@ -256,20 +258,22 @@ mod tests {
                     prepared: vec![],
                     submitted: vec![],
                     receipts: HashMap::new(),
-                    head: 0,
+                    heads: HashMap::new(),
                     effects: vec![],
                 }),
             }
         }
-        fn included(&self, state: &mut State, hash: Felt, orders: &[u64], rejection: bool) -> TransactionReceipt {
-            let reverted = !rejection && orders.iter().any(|order| Some(*order) == self.poison);
+        fn included(&self, state: &mut State, hash: Felt, indexes: &[usize], rejection: bool) -> TransactionReceipt {
+            let reverted = !rejection && indexes.iter().any(|index| Some(*index) == self.poison);
             let mut receipt = InvokeTransactionReceipt { transaction_hash: hash, ..Default::default() };
             if reverted {
                 receipt.execution_result = ExecutionResult::Reverted { reason: "Out of gas".into() };
             } else {
-                for order in orders {
-                    assert_eq!(*order, state.head + 1);
-                    let ticket = &self.tickets[*order as usize - 1];
+                for index in indexes {
+                    let ticket = &self.tickets[*index];
+                    let head = state.heads.entry(ticket.intent.game).or_default();
+                    assert_eq!(ticket.envelope.order, *head + 1);
+                    *head = ticket.envelope.order;
                     receipt.events.push(Event {
                         from_address: ticket.intent.deployment,
                         keys: vec![
@@ -281,14 +285,13 @@ mod tests {
                             ticket.intent.actor,
                             ticket.intent.nonce.into(),
                             Felt::ONE,
-                            (*order).into(),
+                            ticket.envelope.order.into(),
                             if rejection { Felt::TWO } else { Felt::ONE },
                             if rejection { Felt::from(99) } else { Felt::ZERO },
                         ],
                     });
-                    state.head = *order;
                     if !rejection {
-                        state.effects.push(*order);
+                        state.effects.push(*index);
                     }
                 }
             }
@@ -309,16 +312,14 @@ mod tests {
             payload: Vec<Felt>,
         ) -> anyhow::Result<(Felt, BroadcastedInvokeTxn)> {
             let mut state = self.state.lock().unwrap();
-            let orders = self
-                .tickets
-                .iter()
-                .filter_map(|ticket| {
-                    let fields = ticket.calldata().unwrap();
-                    payload.windows(fields.len()).any(|window| window == fields).then_some(ticket.envelope.order)
+            let tickets = (0..self.tickets.len())
+                .filter(|index| {
+                    let fields = self.tickets[*index].calldata().unwrap();
+                    payload.windows(fields.len()).any(|window| window == fields)
                 })
                 .collect::<Vec<_>>();
-            assert!(!orders.is_empty());
-            state.prepared.push(Prepared { selector, payload, orders });
+            assert!(!tickets.is_empty());
+            state.prepared.push(Prepared { selector, payload, tickets });
             let rpc = InvokeTransactionV3::default().to_rpc_v0_10_2();
             Ok((
                 Felt::from(state.prepared.len() as u64),
@@ -332,12 +333,12 @@ mod tests {
                 return Ok(Execution::Included(Box::new(receipt.clone())));
             }
             let index = usize::try_from(hash).unwrap() - 1;
-            let orders = state.prepared[index].orders.clone();
+            let tickets = state.prepared[index].tickets.clone();
             let rejection = state.prepared[index].selector == "reject_execution";
             if state.submitted.len() == 1 {
                 match self.first {
                     FirstSubmission::LostAfterExecution => {
-                        self.included(&mut state, hash, &orders, rejection);
+                        self.included(&mut state, hash, &tickets, rejection);
                         anyhow::bail!("lost result after node execution");
                     }
                     FirstSubmission::LostBeforeExecution => anyhow::bail!("temporary internal submission error"),
@@ -347,33 +348,35 @@ mod tests {
                     FirstSubmission::Normal => {}
                 }
             }
-            Ok(Execution::Included(Box::new(self.included(&mut state, hash, &orders, rejection))))
+            Ok(Execution::Included(Box::new(self.included(&mut state, hash, &tickets, rejection))))
         }
         fn receipt(&self, hash: Felt) -> anyhow::Result<Option<TransactionReceipt>> {
             Ok(self.state.lock().unwrap().receipts.get(&hash).cloned())
         }
-        async fn head_order(&self) -> anyhow::Result<u64> {
-            Ok(self.state.lock().unwrap().head)
+        async fn head_order(&self, game: Felt) -> anyhow::Result<u64> {
+            Ok(self.state.lock().unwrap().heads.get(&game).copied().unwrap_or_default())
         }
         async fn wait_for_state_change(&self) {}
     }
+    /// Tickets alternate between games 1 and 2, each numbering its own orders from one.
     fn pending(count: u64) -> (AdmissionSlots, Vec<PendingTicket>, Vec<watch::Receiver<ActionStatus>>) {
         let slots = AdmissionSlots::default();
         let mut tickets = vec![];
         let mut statuses = vec![];
-        for order in 1..=count {
+        for index in 0..count {
+            let order = index / 2 + 1;
             let intent = Intent {
                 chain: Felt::ONE,
                 deployment: Felt::TWO,
-                game: Felt::ONE,
-                actor: Felt::from(order + 100),
+                game: Felt::from(index % 2 + 1),
+                actor: Felt::from(index + 100),
                 nonce: 0,
                 command: Felt::ONE,
                 rules: Felt::ONE,
                 valid_from: 0,
                 valid_until: 500,
                 last_order: 100,
-                arguments: if order == 2 { vec![Felt::ONE; 254] } else { vec![] },
+                arguments: if index == 1 { vec![Felt::ONE; 254] } else { vec![] },
             };
             let action = intent.identity().unwrap();
             let Slot::New(permit) = slots.reserve(intent.actor, action).unwrap() else { panic!("new actor") };
@@ -386,7 +389,8 @@ mod tests {
                         order,
                         timestamp: 10,
                         execution_config: Felt::ONE,
-                        root: [order as u8; 32],
+                        epoch: 1,
+                        root: [index as u8; 32],
                     },
                     r: Felt::ONE,
                     s: Felt::TWO,
@@ -401,32 +405,33 @@ mod tests {
         let (slots, tickets, statuses) = pending(3);
         let node = Arc::new(TestNode::new(
             tickets.iter().map(|ticket| ticket.record.clone()).collect(),
-            Some(2),
+            Some(1),
             FirstSubmission::Normal,
         ));
         execute(node.clone(), tickets).await.unwrap();
         let state = node.state.lock().unwrap();
-        assert_eq!(state.effects, vec![1, 3]);
-        assert_eq!(state.head, 3);
+        // Game 2's poisoned first ticket is rejected in its own order; game 1 reaches order two.
+        assert_eq!(state.effects, vec![0, 2]);
+        assert_eq!((state.heads[&Felt::ONE], state.heads[&Felt::TWO]), (2, 1));
         assert_eq!(
             state
                 .prepared
                 .iter()
                 .filter(|tx| tx.selector == "reject_execution")
-                .map(|tx| tx.orders.clone())
+                .map(|tx| tx.tickets.clone())
                 .collect::<Vec<_>>(),
-            vec![vec![2]]
+            vec![vec![1]]
         );
         for (index, status) in statuses.iter().enumerate() {
             assert!(
-                matches!(*status.borrow(), ActionStatus::Recorded { order, succeeded, nonce_consumed: true, .. } if order == index as u64 + 1 && succeeded == (order != 2))
+                matches!(*status.borrow(), ActionStatus::Recorded { order, succeeded, nonce_consumed: true, .. } if order == index as u64 / 2 + 1 && succeeded == (index != 1))
             );
         }
-        assert!(matches!(slots.reserve(Felt::from(102), Felt::from(999)), Ok(Slot::New(_))));
+        assert!(matches!(slots.reserve(Felt::from(101), Felt::from(999)), Ok(Slot::New(_))));
     }
     #[tokio::test]
     async fn lost_receipt_after_execution_adopts_outcome_without_duplicate_or_rejection() {
-        let (_, tickets, statuses) = pending(1);
+        let (_, tickets, statuses) = pending(2);
         let node = Arc::new(TestNode::new(
             tickets.iter().map(|ticket| ticket.record.clone()).collect(),
             None,
@@ -434,14 +439,16 @@ mod tests {
         ));
         execute(node.clone(), tickets).await.unwrap();
         let state = node.state.lock().unwrap();
-        assert_eq!(state.effects, vec![1]);
+        assert_eq!(state.effects, vec![0, 1]);
         assert_eq!(state.prepared.len(), 1);
         assert_eq!(state.submitted.len(), 1);
-        assert!(matches!(*statuses[0].borrow(), ActionStatus::Recorded { succeeded: true, .. }));
+        assert!(statuses
+            .iter()
+            .all(|status| matches!(*status.borrow(), ActionStatus::Recorded { order: 1, succeeded: true, .. })));
     }
     #[tokio::test]
     async fn lost_receipt_before_execution_replays_identical_transaction_and_context() {
-        let (_, tickets, statuses) = pending(1);
+        let (_, tickets, statuses) = pending(2);
         let expected = batch_calldata(tickets.iter().map(|ticket| &ticket.record), false).unwrap();
         let node = Arc::new(TestNode::new(
             tickets.iter().map(|ticket| ticket.record.clone()).collect(),
@@ -450,11 +457,13 @@ mod tests {
         ));
         execute(node.clone(), tickets).await.unwrap();
         let state = node.state.lock().unwrap();
-        assert_eq!(state.effects, vec![1]);
+        assert_eq!(state.effects, vec![0, 1]);
         assert_eq!(state.prepared.len(), 1);
         assert_eq!(state.prepared[0].payload, expected);
         assert_eq!(state.submitted, vec![Felt::ONE, Felt::ONE]);
-        assert!(matches!(*statuses[0].borrow(), ActionStatus::Recorded { succeeded: true, .. }));
+        assert!(statuses
+            .iter()
+            .all(|status| matches!(*status.borrow(), ActionStatus::Recorded { order: 1, succeeded: true, .. })));
     }
     #[tokio::test]
     async fn deterministic_executor_refusal_rejects_one_ticket_and_advances() {
@@ -465,7 +474,7 @@ mod tests {
             FirstSubmission::DeterministicRefusal,
         ));
         execute(node.clone(), tickets).await.unwrap();
-        assert_eq!(node.state.lock().unwrap().head, 1);
+        assert_eq!(node.state.lock().unwrap().heads[&Felt::ONE], 1);
         assert!(node.state.lock().unwrap().effects.is_empty());
         assert!(matches!(*statuses[0].borrow(), ActionStatus::Recorded { succeeded: false, nonce_consumed: true, .. }));
     }
