@@ -125,18 +125,21 @@ use anyhow::Context;
 use dashmap::DashMap;
 use mc_db::{rocksdb::RocksDBStorage, MadaraBackend, MadaraStorageRead, MadaraStorageWrite};
 use metrics::{ExternalDbOutboxMetrics, MempoolMetrics};
+use mp_convert::ToFelt;
 use mp_transactions::validated::{TxTimestamp, ValidatedToBlockifierTxError, ValidatedTransaction};
 use mp_utils::service::ServiceContext;
 use notify::MempoolInnerWithNotify;
 use starknet_api::core::Nonce;
 use starknet_api::transaction::TransactionHash;
 use starknet_types_core::felt::Felt;
-use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use topic_pubsub::TopicWatchPubsub;
 pub use transaction_status::{PreConfirmationStatus, TransactionStatus, WatchTransactionStatus};
 
 mod chain_watcher_task;
+#[cfg(test)]
+mod contiguous_tests;
 mod inner;
 mod notify;
 mod topic_pubsub;
@@ -250,6 +253,20 @@ impl<D: MadaraStorageRead> Mempool<D> {
     }
 }
 
+/// Only startup reconciliation or an actual chain replacement may lower an account nonce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NonceUpdateMode {
+    Advance,
+    Replace,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InsertionMode {
+    New,
+    Reload,
+    Requeue,
+}
+
 impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
     async fn load_txs_from_db(&self) -> Result<(), anyhow::Error> {
         if !self.config.save_to_db {
@@ -265,24 +282,152 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
                     continue;
                 }
             };
-            let is_new_tx = false; // do not trigger metrics update and db update.
-            if let Err(err) = self.add_tx(tx, is_new_tx).await {
+            let tx_hash = tx.hash;
+            if let Err(err) = self.add_tx(tx, InsertionMode::Reload).await {
                 match err {
+                    MempoolInsertionError::InnerMempool(TxInsertionError::NonceTooLow { .. }) => {
+                        // Admission now rejects transactions already covered by internal execution.
+                        // They never enter the pool for the later reconciliation pass to remove.
+                        self.remove_saved_txs_by_hashes([tx_hash]);
+                    }
                     MempoolInsertionError::InnerMempool(TxInsertionError::TooOld { .. }) => {} // do nothing
                     err => tracing::warn!("Could not re-add mempool transaction from db: {err:#}"),
                 }
             }
         }
+        self.reconcile_loaded_txs_with_chain_head().await?;
+        Ok(())
+    }
+
+    /// Reconciles persisted mempool accounts with the latest confirmed and internal preconfirmed nonces.
+    /// Transactions made stale by durable chain progress are removed before normal intake resumes.
+    async fn reconcile_loaded_txs_with_chain_head(&self) -> Result<(), anyhow::Error> {
+        let contract_addresses = {
+            let guard = self.inner.read().await;
+            guard.contract_addresses().map(|address| address.to_felt()).collect::<Vec<_>>()
+        };
+        if contract_addresses.is_empty() {
+            return Ok(());
+        }
+
+        let head = self.backend.chain_head_state();
+        let confirmed_view = self.backend.view_on_latest_confirmed();
+        let mut nonce_updates = HashMap::with_capacity(contract_addresses.len());
+
+        let mut preconfirmed_nonce_overrides = HashMap::new();
+        if let Some(internal_preconfirmed_tip) = head.internal_preconfirmed_tip {
+            let start_block_n = head.confirmed_tip.map(|n| n.saturating_add(1)).unwrap_or(0);
+            for block_number in start_block_n..=internal_preconfirmed_tip {
+                let preconfirmed_view = self
+                    .backend
+                    .block_view_on_preconfirmed(block_number)
+                    .with_context(|| format!("Missing preconfirmed block #{block_number} during mempool startup"))?;
+                for executed_tx in preconfirmed_view.borrow_content().executed_transactions() {
+                    preconfirmed_nonce_overrides
+                        .extend(executed_tx.state_diff.nonces.iter().map(|(&addr, &nonce)| (addr, nonce)));
+                }
+            }
+        }
+
+        for contract_address in contract_addresses {
+            let account_nonce = preconfirmed_nonce_overrides
+                .get(&contract_address)
+                .copied()
+                .or(confirmed_view.get_contract_nonce(&contract_address)?)
+                .unwrap_or(Felt::ZERO);
+            nonce_updates.insert(contract_address, account_nonce);
+        }
+
+        self.update_account_nonces(nonce_updates, NonceUpdateMode::Replace).await
+    }
+
+    /// Applies canonical account nonces to the inner mempool and collects transactions made stale.
+    /// Metrics, persistence, and status notifications are updated after releasing the write lock.
+    async fn update_account_nonces(
+        &self,
+        nonce_updates: HashMap<Felt, Felt>,
+        mode: NonceUpdateMode,
+    ) -> Result<(), anyhow::Error> {
+        if nonce_updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut removed_txs = smallvec::SmallVec::<[ValidatedTransaction; 1]>::new();
+        let summary = {
+            let mut guard = self.inner.write().await;
+            for (contract_address, account_nonce) in nonce_updates {
+                let address = contract_address.try_into().context("Invalid contract address")?;
+                let mut nonce = Nonce(account_nonce);
+                if mode == NonceUpdateMode::Advance {
+                    // Admission can observe a newer chain state before this watcher acquires the lock.
+                    nonce = nonce.max(guard.get_account_nonce(&address).copied().unwrap_or_default());
+                }
+                guard.update_account_nonce(&address, &nonce, &mut removed_txs);
+            }
+            guard.summary()
+        };
+        self.metrics.record_mempool_state(&summary);
+        self.on_txs_removed(&removed_txs);
+
         Ok(())
     }
 
     /// Accept a new validated transaction.
     pub async fn accept_tx(&self, tx: ValidatedTransaction) -> Result<(), MempoolInsertionError> {
-        self.add_tx(tx, /* is_new_tx */ true).await
+        self.add_tx(tx, InsertionMode::New).await
     }
 
-    /// Use `is_new_tx: false` when loading transactions from db, so that we skip saving in db and updating metrics.
-    async fn add_tx(&self, tx: ValidatedTransaction, is_new_tx: bool) -> Result<(), MempoolInsertionError> {
+    /// Restore previously admitted work deferred by execution, without publishing a
+    /// second admission, rewriting its saved entry, or duplicating external delivery.
+    /// Consumed transactions retain capacity until this transfers it back under
+    /// the mempool lock. Ordinary nonce, TTL and replacement checks still apply.
+    pub async fn requeue_tx(&self, tx: ValidatedTransaction) -> Result<(), MempoolInsertionError> {
+        self.add_tx(tx, InsertionMode::Requeue).await
+    }
+
+    /// Releases admission capacity for terminal executor results after persistence.
+    /// Deferred hashes must be excluded: requeue transfers their reservations back
+    /// to queued capacity, and another batch may already have consumed them again.
+    pub async fn finish_consumed_transactions(&self, hashes: &[Felt]) {
+        let mut lock = self.inner.write().await;
+        for hash in hashes {
+            lock.release_consumed(hash);
+        }
+    }
+
+    /// Resolve a recreated account against execution, which can run ahead of the externally visible head.
+    /// The caller holds the mempool write lock so an account cannot drain between lookup and insertion.
+    fn account_nonce_for_insertion(
+        &self,
+        inner: &InnerMempool,
+        address: &Felt,
+    ) -> Result<Nonce, MempoolInsertionError> {
+        let contract_address = (*address).try_into().map_err(|_| TxInsertionError::InvalidContractAddress)?;
+        if let Some(nonce) = inner.get_account_nonce(&contract_address) {
+            return Ok(*nonce);
+        }
+
+        let (head, views) = self.backend.internal_preconfirmed_views()?;
+        for view in views.iter().rev() {
+            if let Some(nonce) = view
+                .borrow_content()
+                .executed_transactions()
+                .rev()
+                .find_map(|tx| tx.state_diff.nonces.get(address).copied())
+            {
+                return Ok(Nonce(nonce));
+            }
+        }
+        let nonce = match head.confirmed_tip {
+            Some(block_n) => self.backend.db.get_contract_nonce_at(block_n, address)?.unwrap_or(Felt::ZERO),
+            None => Felt::ZERO,
+        };
+        Ok(Nonce(nonce))
+    }
+
+    /// Reload and requeue preserve the original admission side effects.
+    async fn add_tx(&self, tx: ValidatedTransaction, mode: InsertionMode) -> Result<(), MempoolInsertionError> {
+        let is_new_tx = mode == InsertionMode::New;
         tracing::debug!("Accepting transaction tx_hash={:#x} is_new_tx={is_new_tx}", tx.hash);
 
         let mut outbox_id = None;
@@ -303,14 +448,17 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
             }
         }
 
-        let now = TxTimestamp::now();
-        let account_nonce =
-            self.backend.view_on_latest().get_contract_nonce(&tx.contract_address)?.unwrap_or(Felt::ZERO);
         let mut removed_txs = smallvec::SmallVec::<[ValidatedTransaction; 1]>::new();
 
         let (ret, summary) = {
             let mut lock = self.inner.write().await;
-            let ret = lock.insert_tx(now, tx.clone(), Nonce(account_nonce), &mut removed_txs);
+            if mode == InsertionMode::Requeue {
+                // Transfer the reservation back to queued capacity under the same lock.
+                lock.release_consumed(&tx.hash);
+            }
+            let ret = self.account_nonce_for_insertion(&lock, &tx.contract_address).and_then(|nonce| {
+                lock.insert_tx(TxTimestamp::now(), tx.clone(), nonce, &mut removed_txs).map_err(Into::into)
+            });
             (ret, lock.summary())
         };
 
@@ -339,7 +487,7 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
             }
             self.on_tx_added(&tx, is_new_tx);
         }
-        ret.map_err(Into::into)
+        ret
     }
 
     /// Update secondary state when a new transaction has been successfully added to the mempool.
@@ -558,7 +706,7 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
     /// If the mempool has no mempool that can be consumed, this function will wait until there is at least 1 transaction to consume.
     /// This holds the lock to the inner mempool - use with care.
     pub async fn get_consumer(&self) -> MempoolConsumer {
-        MempoolConsumer { lock: self.inner.get_write_access_wait_for_ready().await }
+        MempoolConsumer { lock: self.inner.get_write_access_wait_for_ready().await, successor: None }
     }
 
     pub fn subscribe_new_transactions(&self) -> tokio::sync::broadcast::Receiver<Arc<ValidatedTransaction>> {
@@ -574,10 +722,44 @@ impl<D: MadaraStorageRead + MadaraStorageWrite> Mempool<D> {
 /// This holds the lock to the inner mempool - use with care.
 pub struct MempoolConsumer {
     lock: MempoolWriteAccess,
+    successor: Option<ContiguousNonceCursor>,
+}
+
+struct ContiguousNonceCursor {
+    address: starknet_api::core::ContractAddress,
+    next_nonce: Nonce,
+    taken: usize,
+}
+impl MempoolConsumer {
+    /// Takes consecutive nonces, yielding to another ready account at a gap or the per-account limit.
+    /// Excess transactions stay queued. Zero is treated as a limit of one.
+    /// Dropping the consumer discards its cursor, never advancing the chain nonce.
+    /// The caller must execute in order, requeue future-nonce failures and release
+    /// completed reservations with `finish_consumed_transactions`; ordinary
+    /// iteration remains available when only independently ready heads are wanted.
+    pub fn next_contiguous(&mut self, max_txs_per_account_per_batch: usize) -> Option<ValidatedTransaction> {
+        let (tx, taken) = self
+            .successor
+            .take()
+            .filter(|cursor| cursor.taken < max_txs_per_account_per_batch.max(1))
+            .and_then(|cursor| {
+                self.lock.pop_contiguous(cursor.address, cursor.next_nonce).map(|tx| (tx, cursor.taken + 1))
+            })
+            .or_else(|| self.lock.pop_next_ready().map(|tx| (tx, 1)))?;
+        self.lock.reserve_consumed(&tx);
+        self.successor = tx
+            .contract_address
+            .try_into()
+            .ok()
+            .zip(Nonce(tx.transaction.nonce()).try_increment().ok())
+            .map(|(address, next_nonce)| ContiguousNonceCursor { address, next_nonce, taken });
+        Some(tx)
+    }
 }
 impl Iterator for MempoolConsumer {
     type Item = ValidatedTransaction;
     fn next(&mut self) -> Option<Self::Item> {
+        self.successor = None;
         self.lock.pop_next_ready()
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -589,6 +771,11 @@ impl Iterator for MempoolConsumer {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use mc_db::preconfirmed::{PreconfirmedBlock, PreconfirmedExecutedTransaction};
+    use mp_block::{header::PreconfirmedHeader, TransactionWithReceipt};
+    use mp_receipt::{InvokeTransactionReceipt, TransactionReceipt};
+    use mp_state_update::TransactionStateUpdate;
+    use mp_transactions::{InvokeTransaction, Transaction};
     use starknet_api::{core::ContractAddress, transaction::TransactionHash};
     use std::time::Duration;
 
@@ -635,6 +822,39 @@ pub(crate) mod tests {
             None,
             true,
         )
+    }
+
+    fn tx_account_with_nonce_and_hash(
+        template: &ValidatedTransaction,
+        nonce: Felt,
+        hash: Felt,
+    ) -> ValidatedTransaction {
+        let mut tx = template.clone();
+        tx.hash = hash;
+        match &mut tx.transaction {
+            Transaction::Invoke(InvokeTransaction::V3(inner)) => inner.nonce = nonce,
+            other => panic!("unexpected transaction variant for test: {other:?}"),
+        }
+        tx
+    }
+
+    fn executed_preconfirmed_tx(tx: &ValidatedTransaction, resulting_nonce: Felt) -> PreconfirmedExecutedTransaction {
+        PreconfirmedExecutedTransaction {
+            transaction: TransactionWithReceipt {
+                transaction: tx.transaction.clone(),
+                receipt: TransactionReceipt::Invoke(InvokeTransactionReceipt {
+                    transaction_hash: tx.hash,
+                    ..Default::default()
+                }),
+            },
+            state_diff: TransactionStateUpdate {
+                nonces: [(tx.contract_address, resulting_nonce)].into(),
+                ..Default::default()
+            },
+            declared_class: None,
+            arrived_at: tx.arrived_at,
+            paid_fee_on_l1: None,
+        }
     }
 
     #[rstest::rstest]
@@ -695,6 +915,91 @@ pub(crate) mod tests {
     #[rstest::rstest]
     #[timeout(Duration::from_millis(1_000))]
     #[tokio::test]
+    async fn mempool_startup_reconciles_loaded_txs_against_internal_preconfirmed_runahead(
+        #[future] backend: Arc<mc_db::MadaraBackend>,
+        tx_account: ValidatedTransaction,
+    ) {
+        let backend = backend.await;
+
+        let block_1_tx = tx_account_with_nonce_and_hash(&tx_account, Felt::ZERO, Felt::from(101u64));
+        let block_2_tx = tx_account_with_nonce_and_hash(&tx_account, Felt::ONE, Felt::from(102u64));
+        let stale_saved_tx = tx_account_with_nonce_and_hash(&tx_account, Felt::ONE, Felt::from(103u64));
+
+        backend
+            .write_access()
+            .new_preconfirmed(PreconfirmedBlock::new_with_content(
+                PreconfirmedHeader { block_number: 1, ..Default::default() },
+                [executed_preconfirmed_tx(&block_1_tx, Felt::ONE)],
+                [],
+            ))
+            .unwrap();
+        backend
+            .write_access()
+            .new_preconfirmed(PreconfirmedBlock::new_with_content(
+                PreconfirmedHeader { block_number: 2, ..Default::default() },
+                [executed_preconfirmed_tx(&block_2_tx, Felt::from(2u64))],
+                [],
+            ))
+            .unwrap();
+
+        let head = backend.chain_head_state();
+        assert_eq!(head.confirmed_tip, Some(0));
+        assert_eq!(head.external_preconfirmed_tip, Some(1));
+        assert_eq!(head.internal_preconfirmed_tip, Some(2));
+
+        backend.write_saved_mempool_transaction(&stale_saved_tx).unwrap();
+        assert_eq!(
+            backend.get_saved_mempool_transactions().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![stale_saved_tx.clone()]
+        );
+
+        let mempool = Mempool::new(backend.clone(), MempoolConfig::default());
+        mempool.load_txs_from_db().await.unwrap();
+
+        assert!(mempool.is_empty().await, "stale tx should be dropped during startup reconciliation");
+        assert!(
+            mempool.get_transaction(CONTRACT_ADDRESS, Felt::ONE, |tx| tx.hash).await.is_none(),
+            "stale nonce should not remain queued after startup"
+        );
+        assert!(
+            backend.get_saved_mempool_transactions().collect::<Result<Vec<_>, _>>().unwrap().is_empty(),
+            "removed txs must also be cleared from persisted mempool storage"
+        );
+    }
+
+    #[rstest::rstest]
+    #[timeout(Duration::from_millis(1_000))]
+    #[tokio::test]
+    async fn nonce_updates_remove_stale_saved_mempool_transactions(
+        #[future] backend: Arc<mc_db::MadaraBackend>,
+        tx_account: ValidatedTransaction,
+    ) {
+        let backend = backend.await;
+        let mempool = Mempool::new(backend.clone(), MempoolConfig::default());
+
+        let queued_tx = tx_account_with_nonce_and_hash(&tx_account, Felt::ZERO, Felt::from(201u64));
+        mempool.accept_tx(queued_tx.clone()).await.unwrap();
+
+        assert_eq!(
+            backend.get_saved_mempool_transactions().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![queued_tx.clone()]
+        );
+
+        mempool
+            .update_account_nonces([(queued_tx.contract_address, Felt::ONE)].into(), NonceUpdateMode::Advance)
+            .await
+            .unwrap();
+
+        assert!(mempool.is_empty().await, "nonce advancement should evict stale txs from the in-memory mempool");
+        assert!(
+            backend.get_saved_mempool_transactions().collect::<Result<Vec<_>, _>>().unwrap().is_empty(),
+            "nonce-based removals must also clear saved mempool storage"
+        );
+    }
+
+    #[rstest::rstest]
+    #[timeout(Duration::from_millis(1_000))]
+    #[tokio::test]
     async fn mempool_accept_writes_outbox(
         #[future] backend: Arc<mc_db::MadaraBackend>,
         tx_account: ValidatedTransaction,
@@ -710,6 +1015,32 @@ pub(crate) mod tests {
         let outbox: Vec<_> = backend.get_external_outbox_transactions(10).collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].tx, tx);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn requeue_does_not_repeat_admission_or_external_delivery(
+        #[future] backend: Arc<mc_db::MadaraBackend>,
+        tx_account: ValidatedTransaction,
+    ) {
+        let backend = backend.await;
+        let config = MempoolConfig::default().with_external_outbox(ExternalOutboxConfig::enabled(true));
+        let mempool = Mempool::new(backend.clone(), config);
+        let mut notifications = mempool.subscribe_new_transactions();
+        mempool.accept_tx(tx_account.clone()).await.unwrap();
+        assert_eq!(*notifications.try_recv().unwrap(), tx_account);
+        let outbox: Vec<_> = backend.get_external_outbox_transactions(10).collect::<Result<_, _>>().unwrap();
+        assert_eq!(outbox.len(), 1);
+        // Simulate successful external delivery before execution defers the tx.
+        backend.delete_external_outbox(outbox[0].id).unwrap();
+        let tx = mempool.get_consumer().await.next().unwrap();
+        mempool.requeue_tx(tx).await.unwrap();
+        assert!(backend.get_external_outbox_transactions(10).next().is_none());
+        assert_matches::assert_matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        assert_eq!(backend.get_saved_mempool_transactions().collect::<Result<Vec<_>, _>>().unwrap(), vec![tx_account]);
     }
 
     #[rstest::rstest]
