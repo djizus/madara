@@ -74,6 +74,14 @@ impl Node {
         .await?
     }
 
+    /// SNIP-6 on the actor: the account decides which device keys sign for it.
+    pub async fn signed_by(&self, actor: Felt, action: Felt, signature: &[Felt]) -> anyhow::Result<bool> {
+        let mut args = vec![action, Felt::from(signature.len() as u64)];
+        args.extend(signature);
+        // 'VALID'
+        Ok(self.view(actor, "is_valid_signature", args).await? == [Felt::from_hex_unchecked("0x56414c4944")])
+    }
+
     pub async fn world_view(&self, name: &'static str, args: Vec<Felt>) -> anyhow::Result<Vec<Felt>> {
         self.view(self.deployment, name, args).await
     }
@@ -271,8 +279,7 @@ mod tests {
                 root: [123; 32],
             },
             intent: intent.clone(),
-            r: Felt::ONE,
-            s: Felt::TWO,
+            signature: vec![Felt::ONE, Felt::TWO],
         };
         let mut second = first.clone();
         // Another game at the same order: attribution follows the intent, never the order alone.
