@@ -122,7 +122,6 @@ pub use rocksdb::statistics::StatsLevel;
 /// |---------|---------|-------------|---------|---------------------------------------|
 /// | Enabled | Enabled | Slowest     | Highest | Production critical data              |
 /// | Enabled | Disable | Medium      | High    | Production (safe on crash) - **RECOMMENDED** |
-/// | Disable | Enabled | Fast        | Medium  | Testing, can tolerate data loss       |
 /// | Disable | Disable | Fastest     | Lowest  | Devnet, testing                       |
 ///
 /// # Safety Considerations
@@ -132,6 +131,8 @@ pub use rocksdb::statistics::StatsLevel;
 ///
 /// - **Fsync enabled**: Forces data to be flushed to disk before acknowledging writes.
 ///   Survives power failures but slower. Disabling fsync relies on OS buffering (faster, survives crashes but not power loss).
+///   Fsync syncs the WAL, so it requires WAL: RocksDB rejects synchronous writes with WAL disabled, and
+///   [`RocksDBStorage::open`](crate::rocksdb::RocksDBStorage::open) refuses that mode before opening the database.
 ///
 /// **Recommended settings:**
 /// - Production: `wal=true, fsync=false` (safe on crash, good performance)
@@ -142,7 +143,7 @@ pub struct DbWriteMode {
     /// Enable Write-Ahead Log (WAL). Provides crash recovery but adds overhead.
     /// Default: true (recommended for production)
     pub wal: bool,
-    /// Enable fsync after writes. Ensures data reaches disk before acknowledging.
+    /// Enable fsync after writes. Ensures data reaches disk before acknowledging. Requires `wal`.
     /// Default: false (recommended for production - survives crashes, faster than fsync)
     pub fsync: bool,
 }
@@ -154,6 +155,15 @@ impl Default for DbWriteMode {
 }
 
 impl DbWriteMode {
+    /// Reject the one combination RocksDB cannot honor: fsync syncs the WAL, so it needs the WAL enabled.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.wal || !self.fsync,
+            "Database fsync requires the write-ahead log; enable WAL or disable fsync"
+        );
+        Ok(())
+    }
+
     /// Convert the write mode to RocksDB WriteOptions
     pub fn to_write_options(&self) -> WriteOptions {
         let mut opts = WriteOptions::default();
@@ -173,7 +183,7 @@ impl std::fmt::Display for DbWriteMode {
         match (self.wal, self.fsync) {
             (true, true) => write!(f, "WAL enabled, fsync enabled (safest)"),
             (true, false) => write!(f, "WAL enabled, fsync disabled (recommended)"),
-            (false, true) => write!(f, "WAL disabled, fsync enabled (fast)"),
+            (false, true) => write!(f, "WAL disabled, fsync enabled (invalid: fsync requires WAL)"),
             (false, false) => write!(f, "WAL disabled, fsync disabled (fastest, least safe)"),
         }
     }
@@ -566,6 +576,41 @@ mod tests {
         let section = &options[section_start + header.len()..];
         let section_end = section.find("\n[").unwrap_or(section.len());
         &section[..section_end]
+    }
+
+    #[test]
+    fn supported_write_modes_write_through_rocksdb_and_survive_reopen() {
+        for write_mode in [
+            DbWriteMode { wal: true, fsync: true },
+            DbWriteMode { wal: true, fsync: false },
+            DbWriteMode { wal: false, fsync: false },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = RocksDBConfig { write_mode, ..RocksDBConfig::default() };
+            let column = ALL_COLUMNS[0].rocksdb_name;
+            {
+                let storage = RocksDBStorage::open(directory.path(), config.clone()).unwrap();
+                let db = &storage.inner.db;
+                db.put_cf_opt(&db.cf_handle(column).unwrap(), b"key", b"value", &storage.inner.writeopts)
+                    .unwrap_or_else(|error| panic!("{write_mode} rejected a write: {error}"));
+            }
+            let storage = RocksDBStorage::open(directory.path(), config).unwrap();
+            let db = &storage.inner.db;
+            assert_eq!(db.get_cf(&db.cf_handle(column).unwrap(), b"key").unwrap().as_deref(), Some(&b"value"[..]));
+        }
+    }
+
+    #[test]
+    fn fsync_without_wal_is_refused_before_the_database_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = RocksDBConfig { write_mode: DbWriteMode { wal: false, fsync: true }, ..RocksDBConfig::default() };
+
+        let Err(error) = RocksDBStorage::open(directory.path(), config) else {
+            panic!("the invalid mode must be refused");
+        };
+
+        assert!(error.to_string().contains("fsync requires the write-ahead log"), "{error}");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0, "the database was opened");
     }
 
     #[test]
